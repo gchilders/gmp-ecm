@@ -54,7 +54,7 @@ libecm_la_LDFLAGS = $(LIBECM_LDFLAGS) -version-info 1:0:0 -g
 libecm_la_LIBADD = $(MULREDCLIBRARY)
 if WANT_GPU 
   libecm_la_SOURCES += cudacommon.cu
-  libecm_la_SOURCES += cgbn_stage1.cu
+  libecm_la_SOURCES += gpu_stage1.cu
   libecm_la_LIBADD += $(CUDALIB)
   libecm_la_LDFLAGS += $(CUDALDFLAGS)
   ecm_LDFLAGS = $(CUDARPATH)
@@ -108,7 +108,7 @@ endif
 include_HEADERS = ecm.h
 noinst_HEADERS = basicdefs.h ecm-impl.h ecm-gmp.h ecm-ecm.h sp.h longlong.h \
                  ecm-params.h mpmod.h ecm-gpu.h torsions.h \
-                 cudacommon.h cgbn_stage1.h \
+                 cudacommon.h gpu_stage1.h gpu_mont.cuh \
                  addlaws.h getprime_r.h ecm_int.h \
                  aprtcle/mpz_aprcl.h aprtcle/jacobi_sum.h
 
@@ -118,7 +118,7 @@ EXTRA_DIST = test.pm1 test.pp1 test.ecm README.lib INSTALL-ecm ecm.xml  \
              hppa/params.h mips/params.h x86_64/params.h         \
              generic/params.h testlong.pp1 testlong.pm1 testlong.ecm \
              test.gwnum INSTALL-gwnum \
-             getprime_r.h cgbn_stage1.cu \
+             getprime_r.h gpu_stage1.cu \
              test.gpuecm README.gpu c155 \
              test_dummy.save test_prime95.save M877.save \
 	     M997.save test_Z2102.n LucasChainGenerator/README \
@@ -130,8 +130,10 @@ DIST_SUBDIRS = x86_64 powerpc64 aprtcle
 DISTCLEANFILES = config.m4 LCG.log Lchain_codes.dat
 
 if WANT_GPU
-.cu.lo: cgbn_stage1.h
-		$(LIBTOOL) --tag=CC --mode=compile $(NVCC) --compile $(NVCCFLAGS) --compiler-options -fPIC $(CPPFLAGS) -o $@ $^ -static
+.cu.lo:
+		$(LIBTOOL) --tag=CC --mode=compile $(NVCC) --compile $(NVCCFLAGS) --compiler-options -fPIC $(CPPFLAGS) -o $@ $< -static
+
+gpu_stage1.lo: gpu_stage1.h gpu_mont.cuh cudacommon.h
 endif
 
 ecm-params:	bench_mulredc$(EXEEXT) tune$(EXEEXT)

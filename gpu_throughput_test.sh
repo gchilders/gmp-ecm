@@ -20,7 +20,7 @@ echo "Using the smallest -gpucurve value within 10% of the best throughput is a 
 echo
 
 filtered() {
- echo "$1" | $ECM -v $2 $B1 0 2>&1 | grep -P "CGBN|Step"
+ echo "$1" | $ECM -v $2 $B1 0 2>&1 | grep -P "arithmetic \\(TPI=|Step"
 }
 
 for number in "(2^269-1)/13822297" "(2^499-1)/20959" "2^997-1" "(2^1877-1)/15017"; do

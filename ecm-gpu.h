@@ -7,9 +7,6 @@
 
 #ifdef WITH_GPU
 
-// Absolute limit of CGBN support
-#define ECM_GPU_CGBN_MAX_BITS 32*1024
-
 #ifndef ECM_GPU_CURVES_BY_BLOCK
   #define ECM_GPU_CURVES_BY_BLOCK 32
 #endif

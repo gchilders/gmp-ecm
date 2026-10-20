@@ -1,6 +1,6 @@
-/* cgbn_stage1.h: header for CGBN (GPU) based ecm stage 1.
+/* gpu_stage1.h: header for GPU based ecm stage 1.
 
-  Copyright 2021 Seth Troisi
+  Copyright 2021 Seth Troisi, 2026 Greg Childers
 
   This program is free software; you can redistribute it and/or modify it
   under the terms of the GNU General Public License as published by the
@@ -18,8 +18,8 @@
   02111-1307, USA.
 */
 
-#ifndef _CGBN_STAGE1_H
-#define _CGBN_STAGE1_H 1
+#ifndef _GPU_STAGE1_H
+#define _GPU_STAGE1_H 1
 
 #include <stdint.h>
 
@@ -29,14 +29,22 @@
 extern "C" {
 #endif
 
-int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
-             const mpz_t N, const mpz_t s,
-             uint32_t curves, uint32_t sigma,
-             float *gputime, int verbose);
+/* Largest input (in bits) the GPU stage 1 kernels accept. */
+size_t gpu_ecm_stage1_max_bits (void);
+
+/* Choose a kernel configuration for N.  If *curves is 0 it is set to the
+   number of curves that fills the GPU for that configuration.  Returns a
+   configuration handle (>= 0) for gpu_ecm_stage1, or ECM_ERROR. */
+int gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose);
+
+int gpu_ecm_stage1 (mpz_t *factors, int *array_found,
+                    const mpz_t N, const mpz_t s,
+                    uint32_t curves, uint32_t sigma, int config,
+                    float *gputime, int verbose);
 
 #ifdef __cplusplus
 }
 #endif
 
 
-#endif /* _CGBN_STAGE1_H */
+#endif /* _GPU_STAGE1_H */

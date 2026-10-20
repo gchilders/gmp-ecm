@@ -441,7 +441,7 @@ AC_ARG_WITH(cuda_compiler,
 
 AC_ARG_WITH(cgbn_include,
   AS_HELP_STRING([--with-cgbn-include=DIR],
-                 [CGBN include directory]),
+                 [ignored (CGBN is no longer used)]),
   [ cgbn_include=$withval ])
 
 AS_IF([test "x$enable_gpu" = "xyes" ],
@@ -587,26 +587,10 @@ AS_IF([test "x$enable_gpu" = "xyes" ],
     AS_IF([test -z "$GPU_ARCH"],
         [AC_MSG_ERROR([No supported compute capabilities found])])
 
-    AS_IF([test -d "$cgbn_include"],
-      [],
-      [AC_MSG_ERROR([Specified CGBN include directory "$cgbn_include" does not exist])])
-
-    AC_MSG_CHECKING([if CGBN is present])
-
-    dnl AC_CHECK_HEADER can't verify NVCC compilability hence NVCC_CHECK_COMPILE
-    NVCC_CHECK_COMPILE(
-      [
-        #include <gmp.h>
-        #include <cgbn.h>
-      ],
-      [-I$cgbn_include $GMPLIB $NVCCFLAGS],
-      [AC_MSG_RESULT([yes])],
-      [
-        AC_MSG_RESULT([no])
-        AC_MSG_ERROR([cgbn.h not found (check if /cgbn needed after <PATH>/include)])
-      ]
-    )
-    NVCCFLAGS="-I$with_cgbn_include $GMPLIB $NVCCFLAGS"
+    dnl CGBN is no longer used; the option is accepted for compatibility.
+    AS_IF([test -n "$cgbn_include"],
+      [AC_MSG_NOTICE([--with-cgbn-include is ignored: CGBN is no longer needed])])
+    NVCCFLAGS="$GMPLIB $NVCCFLAGS"
 
     LIBS="$LIBS_BACKUP"
     LDFLAGS="$LDFLAGS_BACKUP"

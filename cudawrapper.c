@@ -4,7 +4,7 @@
 
 #include "cudacommon.h"
 
-#include "cgbn_stage1.h"
+#include "gpu_stage1.h"
 
 
 #define TWO32 4294967296 /* 2^32 */
@@ -188,6 +188,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   unsigned long dF;
   root_params_t root_params;
   unsigned int nb_curves = 0; /* Local copy of number of curves */
+  int gpu_config;             /* Kernel configuration from gpu_ecm_stage1_plan */
 
   /* This helps keep track of when params is changed in this function. */
   assert((void*) params == (void*) mutable_params); /* params != mutable params */
@@ -201,11 +202,11 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   ECM_STDERR = (params->es == NULL) ? stdout : params->es;
 
   /* Check that N is not too big */
-  size_t max_bits = ECM_GPU_CGBN_MAX_BITS - 6;
+  size_t max_bits = gpu_ecm_stage1_max_bits ();
   if (mpz_sizeinbase (n, 2) > max_bits)
     {
-      outputf (OUTPUT_ERROR, "GPU: Error, input number should be stricly lower"
-                             " than 2^%d\n", max_bits);
+      outputf (OUTPUT_ERROR, "GPU: Error, input number should be at most"
+                             " %zu bits\n", max_bits);
       return ECM_ERROR;
     }
 
@@ -305,8 +306,16 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       mutable_params->gpu_device_init = 1;
     }
 
-  /* Number of curves is only set after select_and_init_GPU */
+  /* Pick the kernel for this size of n; if the number of curves wasn't
+     given, this also chooses it (enough to fill the GPU). */
   nb_curves = params->gpu_number_of_curves;
+  gpu_config = gpu_ecm_stage1_plan (n, &nb_curves, params->verbose);
+  if (gpu_config < 0)
+    {
+      youpi = ECM_ERROR;
+      goto end_gpu_ecm;
+    }
+  mutable_params->gpu_number_of_curves = nb_curves;
 
   ASSERT (params->sigma_is_A == 0);
   if (mpz_sgn (params->sigma) == 0)
@@ -385,8 +394,8 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
 
   st = cputime ();
 
-  youpi = cgbn_ecm_stage1 (factors, array_found, n, params->batch_s, nb_curves,
-                           firstsigma_ui, &gputime, params->verbose);
+  youpi = gpu_ecm_stage1 (factors, array_found, n, params->batch_s, nb_curves,
+                          firstsigma_ui, gpu_config, &gputime, params->verbose);
 
   outputf (OUTPUT_NORMAL, "Computing %u Step 1 took %ldms of CPU time / "
                           "%.0fms of GPU time\n", nb_curves,

@@ -75,14 +75,9 @@ select_and_init_GPU (int device, unsigned int *number_of_curves, int verbose)
     }
 
 
-  if (*number_of_curves == 0) /* if choose the number of curves */
-    {
-      /* Limited by the maximum number of threads per MP */
-      unsigned int blocks_per_multiprocessor = 2;
-      *number_of_curves = blocks_per_multiprocessor * deviceProp.multiProcessorCount
-          * ECM_GPU_CURVES_BY_BLOCK;
-    }
-  else if (*number_of_curves % ECM_GPU_CURVES_BY_BLOCK != 0)
+  /* number_of_curves == 0 is left for gpu_ecm_stage1_plan to choose, as it
+     depends on the size of the input. */
+  if (*number_of_curves % ECM_GPU_CURVES_BY_BLOCK != 0)
     {
       /* number_of_curves should be a multiple of ECM_GPU_CURVES_BY_BLOCK */
       *number_of_curves = (*number_of_curves / ECM_GPU_CURVES_BY_BLOCK + 1) *
