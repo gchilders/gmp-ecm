@@ -55,6 +55,9 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 
 #ifdef HAVE_TORSION
 #include "torsions.h" /* to benefit from more torsion groups */
+#ifdef WITH_GPU
+#include "gpu_stage2.h"
+#endif
 #endif
 
 
@@ -140,7 +143,9 @@ usage (void)
     printf ("  -bloadms file With -param 1-3, mmap stage 1 exponent from file.\n");
 #endif
 #ifdef WITH_GPU
-    printf ("  -gpu         Use CGBN for computations stage 1.\n");
+    printf ("  -gpu         Use the GPU for stage 1 and stage 2 (default B2 = %d*B1).\n",
+            GPU_STAGE2_DEFAULT_B2_FACTOR);
+    printf ("  -cpustage2   With -gpu, do stage 2 on the CPU (FFT continuation).\n");
     printf ("  -gpudevice n Use device n to execute GPU code (by default, "
                                                           "CUDA chooses)\n");
     printf ("  -gpucurves n Compute on n curves in parallel on the GPU (by "
@@ -400,6 +405,82 @@ read_bound (mpz_t Bmin, mpz_t Bmax, char *arg, signed int default_bound)
   return read_bound_single(Bmax, arg);
 }
 
+#ifdef WITH_GPU
+/* With -gpu, residues are resumed in batches: one GPU run per group of
+   consecutive save-file lines for the same number, all ECM with -param 3
+   and the same B1done.  On entry X and SIGMA are the first line's residue
+   and sigma; RAWN is that line's number as saved and N what remains to be
+   factored.  Following lines are read while they match (at most MAXC in all,
+   0 = no limit); the first one that does not is pushed back by seeking, so
+   a pipe (-resume -) gives batches of one.  On return X holds the residues
+   mod N packed bits(N) bits apart, and Y the sigmas packed 32 bits apart,
+   which is how gpu_ecm takes a resumed batch.  Returns the curve count. */
+static unsigned int
+gpu_resume_batch (FILE *fd, mpz_t x, mpz_t y, const mpz_t N,
+                  const mpz_t rawN, const mpz_t sigma, double b1done,
+                  unsigned int maxc)
+{
+  const size_t bits = mpz_sizeinbase (N, 2);
+  unsigned int k = 1;
+  mpz_t xs, x2, y2, s2, A2, x02, y02;
+  mpcandi_t n2;
+  int method2, etype2, param2;
+  double b1_2;
+  char program2[256], who2[256], rtime2[256], comment2[256];
+
+  mpz_init (xs);
+  mpz_init (x2);
+  mpz_init (y2);
+  mpz_init (s2);
+  mpz_init (A2);
+  mpz_init (x02);
+  mpz_init (y02);
+  mpcandi_t_init (&n2);
+
+  mpz_mod (xs, x, N);
+  mpz_set (y, sigma);
+  while (maxc == 0 || k < maxc)
+    {
+      long pos = ftell (fd);
+      if (pos < 0)
+        break;
+      param2 = ECM_PARAM_DEFAULT;
+      b1_2 = ECM_DEFAULT_B1_DONE;
+      if (!read_resumefile_line (&method2, x2, y2, &n2, s2, A2, x02, y02,
+                                 &etype2, &param2, &b1_2, program2, who2,
+                                 rtime2, comment2, fd))
+        {
+          fseek (fd, pos, SEEK_SET);   /* also clears end-of-file */
+          break;
+        }
+      if (method2 != ECM_ECM || param2 != ECM_PARAM_BATCH_32BITS_D ||
+          b1_2 != b1done || mpz_cmp (n2.n, rawN) != 0 ||
+          mpz_cmp_ui (s2, 2) < 0 || mpz_sizeinbase (s2, 2) > 32)
+        {
+          fseek (fd, pos, SEEK_SET);
+          break;
+        }
+      mpz_mod (x2, x2, N);
+      mpz_mul_2exp (x2, x2, bits * k);
+      mpz_add (xs, xs, x2);
+      mpz_mul_2exp (s2, s2, 32 * (unsigned long) k);
+      mpz_add (y, y, s2);
+      k++;
+    }
+  mpz_set (x, xs);
+
+  mpz_clear (xs);
+  mpz_clear (x2);
+  mpz_clear (y2);
+  mpz_clear (s2);
+  mpz_clear (A2);
+  mpz_clear (x02);
+  mpz_clear (y02);
+  mpcandi_t_free (&n2);
+  return k;
+}
+#endif
+
 /******************************************************************************
 *                                                                             *
 *                                Main program                                 *
@@ -466,6 +547,9 @@ main (int argc, char *argv[])
   signed long gw_cl_flag = 0;
 #endif
   int use_gpu = 0; /* Do we use the GPU for stage 1 (by default no) */
+  int cpu_stage2 = 0; /* With -gpu, do stage 2 on the CPU instead */
+  int gpu_mode = 0;   /* params->gpu for GPU runs (a resumed residue the GPU
+                         cannot take clears params->gpu for its one run) */
   int gpudevice = -1; /* Which device do we use for GPU code (by default CUDA */
                       /* chooses)                                             */
   unsigned int gpucurves = 0; /* How many curves do we want for GPU code */ 
@@ -894,6 +978,12 @@ main (int argc, char *argv[])
           argv++;
           argc--;
         }
+      else if (strcmp (argv[1], "-cpustage2") == 0)
+        {
+          cpu_stage2 = 1;
+          argv++;
+          argc--;
+        }
       else if ((argc > 2) && (strcmp (argv[1], "-gpudevice") == 0))
         {
           gpudevice = atoi (argv[2]);
@@ -1055,7 +1145,10 @@ main (int argc, char *argv[])
   params->TreeFilename = TreeFilename;
   params->maxmem = maxmem;
   params->stage1time = stage1time;
-  params->gpu = use_gpu;   /* If WITH_GPU is not defined it will always be 0 */
+  /* If WITH_GPU is not defined it will always be 0.  1: both stages on the
+     GPU, 2: stage 1 on the GPU and stage 2 on the CPU. */
+  gpu_mode = use_gpu ? (cpu_stage2 ? 2 : 1) : 0;
+  params->gpu = gpu_mode;
   params->gpu_device = gpudevice; /* If WITH_GPU is not defined or    */
                                   /* use_gpu = 0, it has no meaning   */
   params->gpu_number_of_curves = gpucurves; /* If WITH_GPU is not defined or */
@@ -1064,12 +1157,6 @@ main (int argc, char *argv[])
   /* Open resume file for reading, if resuming is requested */
   if (resumefilename != NULL)
     {
-      /* -resume should not be used with -gpu */
-      if (use_gpu)
-        {
-          fprintf (stderr, "Error, -resume not allowed with -gpu\n");
-          exit (EXIT_FAILURE);
-        }
       if (strcmp (resumefilename, "-") == 0)
         resumefile = stdin;
       else
@@ -1212,6 +1299,30 @@ main (int argc, char *argv[])
             }
   
           cnt = count; /* i.e. 1 */
+
+#ifdef WITH_GPU
+          /* With -gpu, gather this line and the matching ones after it
+             into one GPU batch; a residue the GPU cannot take is resumed
+             on the CPU instead. */
+          if (use_gpu)
+            {
+              params->gpu = gpu_mode;
+              if (method == ECM_ECM
+                  && params->param == ECM_PARAM_BATCH_32BITS_D
+                  && params->sigma_is_A == 0 && mpz_cmp_ui (sigma, 2) >= 0
+                  && mpz_sizeinbase (sigma, 2) <= 32)
+                params->gpu_number_of_curves =
+                  gpu_resume_batch (resumefile, x, y, n.n, resume_lastN,
+                                    sigma, params->B1done, gpucurves);
+              else
+                {
+                  if (verbose >= OUTPUT_NORMAL)
+                    printf ("Not an ECM -param %d residue: resuming it on "
+                            "the CPU\n", ECM_PARAM_BATCH_32BITS_D);
+                  params->gpu = 0;
+                }
+            }
+#endif
 
           if (verbose >= OUTPUT_NORMAL)
             {

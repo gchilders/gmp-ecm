@@ -5,6 +5,7 @@
 #include "cudacommon.h"
 
 #include "gpu_stage1.h"
+#include "gpu_stage2.h"
 
 
 #define TWO32 4294967296 /* 2^32 */
@@ -189,6 +190,12 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   root_params_t root_params;
   unsigned int nb_curves = 0; /* Local copy of number of curves */
   int gpu_config;             /* Kernel configuration from gpu_ecm_stage1_plan */
+  int gpu_stage2;             /* Do stage 2 on the GPU too? */
+  mpz_t B2_parm;              /* B2 as given, or the GPU stage 2 default */
+  /* A resumed batch (B1done set): params->x holds the saved residues and
+     params->y their sigmas, packed as main.c's gpu_resume_batch does. */
+  int resume = !ECM_IS_DEFAULT_B1_DONE (params->B1done);
+  uint32_t *sigmas = NULL;    /* per-curve sigma when resuming, else NULL */
 
   /* This helps keep track of when params is changed in this function. */
   assert((void*) params == (void*) mutable_params); /* params != mutable params */
@@ -227,10 +234,12 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       return ECM_ERROR;
     }
 
-  /* Cannot do resume on GPU */
-  if (!ECM_IS_DEFAULT_B1_DONE(params->B1done) && params->B1done < B1)
+  /* A resumed batch needs its curve count and per-curve sigmas */
+  if (resume && (params->gpu_number_of_curves == 0 || mpz_sgn (params->y) <= 0
+                 || mpz_sgn (params->x) <= 0))
     {
-      outputf (OUTPUT_ERROR, "GPU: Error, cannot resume on GPU.\n");
+      outputf (OUTPUT_ERROR, "GPU: Error, resuming needs the residues in x, "
+               "their sigmas in y and gpu_number_of_curves set.\n");
       return ECM_ERROR;
     }
 
@@ -275,16 +284,35 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   mpz_init (B2);
   mpz_init (B2min);
 
+  /* params->gpu == 1: stage 2 on the GPU too; 2: stage 2 on the CPU.
+     GPU stage 2 costs time linear in B2, so its default B2 is a fixed
+     multiple of B1 rather than the CPU's (much larger) default. */
+  gpu_stage2 = (params->gpu == 1);
+  mpz_init_set (B2_parm, params->B2);
+  if (gpu_stage2 && ECM_IS_DEFAULT_B2 (B2_parm))
+    mpz_set_d (B2_parm, GPU_STAGE2_DEFAULT_B2_FACTOR * B1);
+
   youpi = set_stage_2_params (
-          B2, params->B2,
+          B2, B2_parm,
           B2min, params->B2min,
           &root_params,
           B1, &mutable_params->k, params->S, params->use_ntt, &po2, &dF,
                               params->TreeFilename, params->maxmem, Fermat, modulus);
+  if (gpu_stage2)
+    {
+      /* the GPU continuation covers exactly the primes in (B2min, B2], with
+         no Brent-Suyama extension */
+      mpz_set (B2, B2_parm);
+      root_params.S = 1;
+    }
+  mpz_clear (B2_parm);
   if (youpi == ECM_ERROR)
       goto end_gpu_ecm;
 
-  /* Initialize the GPU if necessary and determine nb_curves */
+  /* Initialize the GPU if necessary and determine nb_curves.  The
+     initialization rounds a requested curve count up, which must not
+     happen to a resumed batch: its count is its number of residues. */
+  nb_curves = params->gpu_number_of_curves;
   if (!params->gpu_device_init)
     {
       st = cputime ();
@@ -308,7 +336,8 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
 
   /* Pick the kernel for this size of n; if the number of curves wasn't
      given, this also chooses it (enough to fill the GPU). */
-  nb_curves = params->gpu_number_of_curves;
+  if (!resume)
+    nb_curves = params->gpu_number_of_curves;
   gpu_config = gpu_ecm_stage1_plan (n, &nb_curves, params->verbose);
   if (gpu_config < 0)
     {
@@ -318,7 +347,31 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   mutable_params->gpu_number_of_curves = nb_curves;
 
   ASSERT (params->sigma_is_A == 0);
-  if (mpz_sgn (params->sigma) == 0)
+  if (resume)
+    {
+      /* the batch's own sigmas, 32 bits each in params->y */
+      mpz_t rest;
+      mpz_init_set (rest, params->y);
+      sigmas = (uint32_t *) malloc (nb_curves * sizeof (uint32_t));
+      ASSERT_ALWAYS (sigmas != NULL);
+      for (i = 0; i < nb_curves; i++)
+        {
+          mpz_fdiv_r_2exp (tmp_A, rest, 32);
+          sigmas[i] = (uint32_t) mpz_get_ui (tmp_A);
+          mpz_fdiv_q_2exp (rest, rest, 32);
+          if (sigmas[i] < 2)
+            {
+              outputf (OUTPUT_ERROR, "GPU: Error, resumed sigma %u of curve "
+                       "%u should be in [2,%lu]\n", sigmas[i], i, TWO32 - 1);
+              mpz_clear (rest);
+              youpi = ECM_ERROR;
+              goto end_gpu_ecm;
+            }
+        }
+      mpz_clear (rest);
+      mpz_set_ui (mutable_params->sigma, sigmas[0]);
+    }
+  else if (mpz_sgn (params->sigma) == 0)
     {
       /* generate random value in [2, 2^32 - nb_curves - 1] */
       mpz_set_ui (mutable_params->sigma,
@@ -336,6 +389,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
         }
     }
   firstsigma_ui = mpz_get_ui (params->sigma);
+#define CURVE_SIGMA(i) (sigmas != NULL ? sigmas[i] : (i) + firstsigma_ui)
 
   print_B1_B2_poly (OUTPUT_NORMAL, ECM_ECM, B1, params->B1done,  params->B2min, B2min,
                     B2, params->S, params->sigma, params->sigma_is_A, ECM_EC_TYPE_MONTGOMERY,
@@ -378,35 +432,65 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
     }
 
 
-  /* Compute s */
-  if (B1 != params->batch_last_B1_used || mpz_cmp_ui (params->batch_s, 1) <= 0)
+  if (resume)
     {
-      mutable_params->batch_last_B1_used = B1;
-
-      st = cputime ();
-      /* construct the batch exponent */
-      compute_s (mutable_params->batch_s, B1, NULL);
-      outputf (OUTPUT_VERBOSE, "Computing batch product (of %" PRIu64
-                               " bits) of primes up to B1=%1.0f took %ldms\n",
-                               mpz_sizeinbase (params->batch_s, 2), B1, cputime () - st);
+      /* start from the saved residues */
+      mpz_t rest;
+      size_t bits = mpz_sizeinbase (n, 2);
+      mpz_init_set (rest, params->x);
+      for (i = 0; i < nb_curves; i++)
+        {
+          mpz_fdiv_r_2exp (factors[i], rest, bits);
+          mpz_fdiv_q_2exp (rest, rest, bits);
+          mpz_mod (factors[i], factors[i], n);
+        }
+      mpz_clear (rest);
     }
 
+  tottime = 0;
+  if (!resume || params->B1done < B1)
+    {
+      mpz_t s_cont;   /* stage 1 exponent for a resumed batch */
+      mpz_init (s_cont);
+      st = cputime ();
+      if (resume)
+        {
+          /* Continue from B1done: one more factor p for every prime power
+             p^k in (B1done, B1], which brings the point to exactly where a
+             run from scratch to B1 would have it. */
+          compute_s_range (s_cont, params->B1done, B1);
+          outputf (OUTPUT_VERBOSE, "Continuing stage 1 from B1=%1.0f "
+                   "(exponent of %" PRIu64 " bits)\n", params->B1done,
+                   (uint64_t) mpz_sizeinbase (s_cont, 2));
+        }
+      else if (B1 != params->batch_last_B1_used
+               || mpz_cmp_ui (params->batch_s, 1) <= 0)
+        {
+          mutable_params->batch_last_B1_used = B1;
+          /* construct the batch exponent */
+          compute_s (mutable_params->batch_s, B1, NULL);
+          outputf (OUTPUT_VERBOSE, "Computing batch product (of %" PRIu64
+                   " bits) of primes up to B1=%1.0f took %ldms\n",
+                   mpz_sizeinbase (params->batch_s, 2), B1, cputime () - st);
+        }
 
-  st = cputime ();
+      st = cputime ();
+      youpi = gpu_ecm_stage1 (factors, array_found, n,
+                              resume ? s_cont : params->batch_s, nb_curves,
+                              firstsigma_ui, sigmas, resume, gpu_config,
+                              &gputime, params->verbose);
+      mpz_clear (s_cont);
 
-  youpi = gpu_ecm_stage1 (factors, array_found, n, params->batch_s, nb_curves,
-                          firstsigma_ui, gpu_config, &gputime, params->verbose);
-
-  outputf (OUTPUT_NORMAL, "Computing %u Step 1 took %ldms of CPU time / "
-                          "%.0fms of GPU time\n", nb_curves,
-                          elltime (st, cputime ()), gputime);
-  outputf (OUTPUT_VERBOSE, "Throughput: %.3f curves per second ",
-                           1000 * nb_curves/gputime);
-  outputf (OUTPUT_VERBOSE, "(on average %.2fms per Step 1)\n",
-                           gputime/nb_curves);
-  tottime = (long) gputime;
-
-  mutable_params->B1done = B1;
+      outputf (OUTPUT_NORMAL, "Computing %u Step 1 took %ldms of CPU time / "
+                              "%.0fms of GPU time\n", nb_curves,
+                              elltime (st, cputime ()), gputime);
+      outputf (OUTPUT_VERBOSE, "Throughput: %.3f curves per second ",
+                               1000 * nb_curves/gputime);
+      outputf (OUTPUT_VERBOSE, "(on average %.2fms per Step 1)\n",
+                               gputime/nb_curves);
+      tottime = (long) gputime;
+      mutable_params->B1done = B1;
+    }
 
   /* GMP documentation says mpz_sizeinbase(op, 2) is always the exact value. */
   size_t n_bits = mpz_sizeinbase(n, 2);
@@ -427,6 +511,29 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   if (mpz_cmp (B2, B2min) < 0)
       goto end_gpu_ecm_factors;
 
+  if (gpu_stage2)
+    {
+      float gputime2 = 0;
+      st2 = cputime ();
+      youpi = gpu_ecm_stage2 (factors, array_found, n, B2min, B2, nb_curves,
+                              firstsigma_ui, sigmas, gpu_config, &gputime2,
+                              params->verbose);
+      if (youpi == ECM_ERROR)
+        goto end_gpu_ecm_factors;
+      for (i = 0; i < nb_curves; i++)
+        if (array_found[i] != ECM_NO_FACTOR_FOUND)
+          outputf (OUTPUT_NORMAL, "GPU: factor %Zd found in Step 2 with"
+                   " curve %u (-sigma 3:%u)\n", factors[i], i, CURVE_SIGMA (i));
+      outputf (OUTPUT_NORMAL, "Computing %u Step 2 took %ldms of CPU time / "
+               "%.0fms of GPU time\n", nb_curves, elltime (st2, cputime ()),
+               gputime2);
+      outputf (OUTPUT_VERBOSE, "Throughput: %.3f Step 2 per second "
+               "(on average %.2fms per Step 2)\n", 1000.0 * nb_curves / gputime2,
+               gputime2 / nb_curves);
+      tottime += (long) gputime2;
+      goto end_gpu_ecm_factors;
+    }
+
   st2 = cputime ();
 
   P.disc = 0; /* For stage2 this needs to be 0, in order not to use CM stuff */
@@ -445,7 +552,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
 
       mpres_set_z (P.x, factors[i], modulus);
       mpres_set_ui (P.y, 1, modulus);
-      A_from_sigma (tmp_A, i+firstsigma_ui, modulus->orig_modulus);
+      A_from_sigma (tmp_A, CURVE_SIGMA (i), modulus->orig_modulus);
       mpres_set_z (P.A, tmp_A, modulus);
 
       /* compute stage 2 */
@@ -480,7 +587,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
         {
           array_found[i] = youpi;
           outputf (OUTPUT_NORMAL, "GPU: factor %Zd found in Step 2 with"
-                " curve %u (-sigma 3:%u)\n", factors[i], i, i+firstsigma_ui);
+                " curve %u (-sigma 3:%u)\n", factors[i], i, CURVE_SIGMA (i));
           /* factor_found corresponds to the first factor found */
           if (factor_found == ECM_NO_FACTOR_FOUND)
             factor_found = youpi;
@@ -542,6 +649,7 @@ end_gpu_ecm_rhotable:
 
 
 end_gpu_ecm:
+  free (sigmas);
   mpz_clear (root_params.i0);
   mpres_clear (P.A, modulus);
   mpres_clear (P.y, modulus);

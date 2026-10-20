@@ -84,16 +84,37 @@ To use your GPU for step 1, just add the -gpu option:
 
   $ echo "(2^835+1)/33" | ./ecm -gpu 1e4
 
-It will compute step 1 on the GPU, and then perform step 2 on the CPU (not in
-parallel).
+It will compute both step 1 and step 2 on the GPU.
+
+Step 2 on the GPU is a baby-step giant-step prime continuation: it covers
+exactly the primes in (B2min, B2], at a cost linear in B2.  Its default B2 is
+therefore 100 * B1, much smaller than the CPU default (which is tuned for the
+CPU's FFT continuation, whose cost grows much more slowly with B2).  A B2 given
+on the command line is always used as is.
+
+To do step 2 on the CPU instead (one curve at a time, with the FFT
+continuation and the usual default B2), add "-cpustage2":
+
+  $ echo "(2^835+1)/33" | ./ecm -gpu -cpustage2 1e4
 
 The only parametrization compatible with GPU code is "-param 3".
 
-You can save the end of step 1 with "-save" and then load the file to execute
-step 2. But you cannot resume to continue step 1 with a bigger B1.
+You can save the end of step 1 with "-save" and resume it later, on the GPU
+too:
+
+  $ ./ecm -gpu -resume saved.txt 1e4 1e6
+
+With "-gpu", consecutive lines for the same number that are ECM with
+"-param 3" and the same B1done are resumed together as one GPU batch (their
+sigmas need not be consecutive; "-gpucurves n" caps the batch size).  If B1 is
+larger than the saved B1done, step 1 is continued on the GPU from B1done to
+B1 (giving exactly the residue a run from scratch to B1 would), then step 2
+runs as usual.  A line the GPU cannot take (another method or parametrization)
+is resumed on the CPU.  Reading the save file from a pipe ("-resume -")
+works, but gives batches of one curve.
 
 The options "-mpzmod", "-modmuln", "-redc", "-nobase2" and "-base2" have no
-effect on step 1, if the "-gpu" option is activated, but will apply for step 2.
+effect on the GPU steps; with "-cpustage2" they apply to step 2.
 
 ##############################################################################
 

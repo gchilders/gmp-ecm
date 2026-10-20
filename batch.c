@@ -264,6 +264,25 @@ dup_add_batch2 (mpres_t x1, mpres_t z1, mpres_t x2, mpres_t z2,
 }
 
 
+/* s <- the stage 1 exponent that takes a point from B1done to B1: one
+   factor p for every prime power p^k with B1done < p^k <= B1.  Since
+   compute_s (B1) is the product of the largest such p^k <= B1, this is
+   exactly compute_s (B1) / compute_s (B1done), so a point resumed from
+   B1done ends where a run from scratch to B1 would have it. */
+void
+compute_s_range (mpz_t s, double B1done, double B1)
+{
+  mpz_t done;
+  mpz_init (done);
+  compute_s (s, (ecm_uint) B1, NULL);
+  if (B1done >= 2.0)
+    {
+      compute_s (done, (ecm_uint) B1done, NULL);
+      mpz_divexact (s, s, done);
+    }
+  mpz_clear (done);
+}
+
 /* Input: x is initial point
           A is curve parameter in Montgomery's form:
           g*y^2*z = x^3 + a*x^2*z + x*z^2

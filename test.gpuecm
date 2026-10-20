@@ -108,9 +108,21 @@ checkcode $? 0
 echo "2^24572+1" | $ECM -sigma 3:92 4 0
 checkcode $? 1
 
-# test for when stage 2 on CPU is needed
-echo "2^349-1" | $ECM -sigma 3:13 587 1261
+# test for when stage 2 is needed.  GPU stage 2 covers exactly the primes
+# <= B2; on curve 3 the point's order mod the factor is 1423.
+echo "2^349-1" | $ECM -sigma 3:13 587 1423
 checkcode $? 6
+
+# same with stage 2 on the CPU (its FFT continuation rounds B2 up to 1446)
+echo "2^349-1" | $ECM -cpustage2 -sigma 3:13 587 1261
+checkcode $? 6
+
+# GPU stage 2 with D=2310: exactly curves 9, 27 and 28 find 2^40-87 in
+# step 2 (checked independently with gpu_dev/gpu_s2_check.py)
+echo "(2^40-87)*(2^521-1)" | $ECM -sigma 3:1224 4000 200000 > test.gpuecm.out
+checkcode $? 14
+checkfactorcount test.gpuecm.out 0 3 1
+rm -f test.gpuecm.out
 
 # test -v option
 $ECM -v 1e3 < ${GMPECM_DATADIR}/c155
@@ -154,10 +166,10 @@ checkcode $? 6
 # fixed with svn 2915.  several test cases given to exercise patch:
 /bin/rm -f test.ecm.save
 # Save file with no factor found in step 1 or step 2
-echo "(5^139+1)/6" | $ECM -save test.ecm.save -sigma 3:9829216 1e3
-# Check -resume and -gpu (should produce an error)
-$ECM -resume test.ecm.save 1e3
-checkcode $? 1
+echo "(5^139+1)/6" | $ECM -cpustage2 -save test.ecm.save -sigma 3:9829216 1e3
+# -resume with -gpu: same B1 and B2 = 0, so nothing to do
+$ECM -resume test.ecm.save 1e3 0
+checkcode $? 0
 # Resume, but find no factor
 $ECMnoGPU -q -resume test.ecm.save 1e3
 checkcode $? 0
@@ -166,8 +178,46 @@ $ECMnoGPU -q -resume test.ecm.save 1e3 1e6
 checkcode $? 6
 /bin/rm -f test.ecm.save
 
+# Resuming on the GPU: continuing stage 1 from a save (in one batch, on the
+# GPU) gives exactly the residues of a run from scratch to the new B1, and a
+# reordered subset with non-consecutive sigmas does too
+echo "(2^521-1)*(2^607-1)" | $ECM -sigma 3:5000 -save test.gpu1.save 1e4 0
+echo "(2^521-1)*(2^607-1)" | $ECM -sigma 3:5000 -save test.gpu2.save 1e3 0
+$ECM -resume test.gpu2.save -save test.gpu3.save 1e4 0
+checkcode $? 0
+grep -o 'X=0x[0-9a-f]*' test.gpu1.save > test.gpu1.x
+grep -o 'X=0x[0-9a-f]*' test.gpu3.save > test.gpu3.x
+if ! cmp -s test.gpu1.x test.gpu3.x
+then
+  echo "############### ERROR ###############"
+  echo "Resumed GPU residues differ from a run from scratch"
+  exit 1
+fi
+grep 'X=' test.gpu2.save | awk 'NR % 3 == 1' | sort -r > test.gpu4.save
+$ECM -resume test.gpu4.save -save test.gpu5.save 1e4 0
+checkcode $? 0
+for line in $(sed -n -e 's/.*SIGMA=\([0-9]*\);.*X=\(0x[0-9a-f]*\).*/\1:\2/p' test.gpu5.save)
+do
+  if ! grep -q "SIGMA=${line%%:*};.*X=${line#*:}" test.gpu1.save
+  then
+    echo "############### ERROR ###############"
+    echo "Resumed GPU residue for sigma ${line%%:*} differs from a run from scratch"
+    exit 1
+  fi
+done
+/bin/rm -f test.gpu1.save test.gpu2.save test.gpu3.save test.gpu4.save \
+           test.gpu5.save test.gpu1.x test.gpu3.x
+
+# Resumed into GPU stage 2 (after continuing stage 1 from 1000 to 4000):
+# the same three curves as a run from scratch find 2^40-87
+echo "(2^40-87)*(2^521-1)" | $ECM -sigma 3:1224 -save test.gpu6.save 1e3 0
+$ECM -resume test.gpu6.save 4000 200000 > test.gpuecm.out
+checkcode $? 14
+checkfactorcount test.gpuecm.out 0 3 1
+/bin/rm -f test.gpu6.save test.gpuecm.out
+
 # Save file after finding factor in step 1
-echo "(5^139+1)/6" | $ECM -save test.ecm.save -sigma 3:2829874052 1e3
+echo "(5^139+1)/6" | $ECM -cpustage2 -save test.ecm.save -sigma 3:2829874052 1e3
 # Resume, but find no factor
 $ECMnoGPU -q -resume test.ecm.save 1e3 10e3
 checkcode $? 0
@@ -177,7 +227,7 @@ checkcode $? 6
 /bin/rm -f test.ecm.save
 
 # Save file after finding factor in step 2
-echo "(5^139+1)/6" | $ECM -save test.ecm.save -sigma 3:1403008725 1e3
+echo "(5^139+1)/6" | $ECM -cpustage2 -save test.ecm.save -sigma 3:1403008725 1e3
 # Resume, but find no factor
 $ECMnoGPU -q -resume test.ecm.save 1e3
 checkcode $? 0
@@ -187,7 +237,7 @@ checkcode $? 6
 /bin/rm -f test.ecm.save
 
 # Save file after finding no factor in step 1 only
-echo "(5^139+1)/6" | $ECM -save test.ecm.save -sigma 3:1403008725 1e3 1
+echo "(5^139+1)/6" | $ECM -cpustage2 -save test.ecm.save -sigma 3:1403008725 1e3 1
 # Resume, but find no factor
 $ECMnoGPU -q -resume test.ecm.save 1e3 5e3
 checkcode $? 0

@@ -55,6 +55,8 @@ libecm_la_LIBADD = $(MULREDCLIBRARY)
 if WANT_GPU 
   libecm_la_SOURCES += cudacommon.cu
   libecm_la_SOURCES += gpu_stage1.cu
+  libecm_la_SOURCES += gpu_stage2.cu gpu_kernels.cu \
+                       gpu_kset_00.cu gpu_kset_01.cu gpu_kset_02.cu gpu_kset_03.cu gpu_kset_04.cu gpu_kset_05.cu gpu_kset_06.cu gpu_kset_07.cu gpu_kset_08.cu gpu_kset_09.cu gpu_kset_10.cu gpu_kset_11.cu gpu_kset_12.cu gpu_kset_13.cu
   libecm_la_LIBADD += $(CUDALIB)
   libecm_la_LDFLAGS += $(CUDALDFLAGS)
   ecm_LDFLAGS = $(CUDARPATH)
@@ -108,7 +110,8 @@ endif
 include_HEADERS = ecm.h
 noinst_HEADERS = basicdefs.h ecm-impl.h ecm-gmp.h ecm-ecm.h sp.h longlong.h \
                  ecm-params.h mpmod.h ecm-gpu.h torsions.h \
-                 cudacommon.h gpu_stage1.h gpu_mont.cuh \
+                 cudacommon.h gpu_stage1.h gpu_stage2.h gpu_mont.cuh gpu_common.cuh \
+                 gpu_kernels.h gpu_kset.cuh gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh \
                  addlaws.h getprime_r.h ecm_int.h \
                  aprtcle/mpz_aprcl.h aprtcle/jacobi_sum.h
 
@@ -118,7 +121,7 @@ EXTRA_DIST = test.pm1 test.pp1 test.ecm README.lib INSTALL-ecm ecm.xml  \
              hppa/params.h mips/params.h x86_64/params.h         \
              generic/params.h testlong.pp1 testlong.pm1 testlong.ecm \
              test.gwnum INSTALL-gwnum \
-             getprime_r.h gpu_stage1.cu \
+             getprime_r.h gpu_stage1.cu gpu_stage2.cu \
              test.gpuecm README.gpu c155 \
              test_dummy.save test_prime95.save M877.save \
 	     M997.save test_Z2102.n LucasChainGenerator/README \
@@ -133,7 +136,23 @@ if WANT_GPU
 .cu.lo:
 		$(LIBTOOL) --tag=CC --mode=compile $(NVCC) --compile $(NVCCFLAGS) --compiler-options -fPIC $(CPPFLAGS) -o $@ $< -static
 
-gpu_stage1.lo: gpu_stage1.h gpu_mont.cuh cudacommon.h
+gpu_stage1.lo: gpu_stage1.h gpu_kernels.h gpu_common.cuh cudacommon.h
+gpu_stage2.lo: gpu_stage1.h gpu_stage2.h gpu_kernels.h gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh cudacommon.h
+gpu_kernels.lo: gpu_kernels.h gpu_common.cuh
+gpu_kset_00.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_01.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_02.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_03.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_04.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_05.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_06.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_07.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_08.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_09.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_10.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_11.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_12.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_13.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 endif
 
 ecm-params:	bench_mulredc$(EXEEXT) tune$(EXEEXT)

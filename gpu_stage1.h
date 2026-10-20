@@ -37,10 +37,18 @@ size_t gpu_ecm_stage1_max_bits (void);
    configuration handle (>= 0) for gpu_ecm_stage1, or ECM_ERROR. */
 int gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose);
 
+/* (TPI, L) of a configuration from gpu_ecm_stage1_plan */
+void gpu_ecm_plan_shape (int config, uint32_t *tpi, uint32_t *L);
+
+/* Stage 1 for CURVES curves: multiply each curve's point by S.  Curve i has
+   sigma + i, or sigmas[i] when SIGMAS is not NULL.  The points start at
+   x = 2 (a fresh run), or at x = factors[i] when FROM_X (resuming a saved
+   residue: S is then the exponent from the saved B1done to the new B1).
+   On return factors[i] is the residue x, or the factor found. */
 int gpu_ecm_stage1 (mpz_t *factors, int *array_found,
                     const mpz_t N, const mpz_t s,
-                    uint32_t curves, uint32_t sigma, int config,
-                    float *gputime, int verbose);
+                    uint32_t curves, uint32_t sigma, const uint32_t *sigmas,
+                    int from_x, int config, float *gputime, int verbose);
 
 #ifdef __cplusplus
 }

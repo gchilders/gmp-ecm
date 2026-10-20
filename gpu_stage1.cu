@@ -60,176 +60,18 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <cuda.h>
 
 #include "cudacommon.h"
-#include "gpu_mont.cuh"
+#include "gpu_common.cuh"
+#include "gpu_kernels.h"
 
 #include "ecm.h"
 #include "ecm-gpu.h"
-
-#define GPU_TPB 128
-#define GPU_SOLO_MAX_L 16
-#define GPU_DIST_MAX_L 24
-/* N must be below 2^(32n - GPU_SPARE_BITS) */
-#define GPU_SPARE_BITS 4
-
-/* ---------------------------------------------------------------------- */
-
-template<int L, bool SOLO>
-__device__ __forceinline__ void
-ladder_step (const gm_group &g,
-             uint32_t (&aX)[L], uint32_t (&aZ)[L],
-             uint32_t (&bX)[L], uint32_t (&bZ)[L],
-             uint32_t d, const uint32_t (&N)[L], const uint32_t (&N2)[L],
-             uint32_t np0)
-{
-  uint32_t t1[L], t2[L];
-
-  gm_add<L, SOLO> (g, t1, bZ, bX);
-  gm_sub<L, SOLO> (g, bZ, bZ, bX, N2);
-  gm_add<L, SOLO> (g, bX, aZ, aX);
-  gm_sub<L, SOLO> (g, aZ, aZ, aX, N2);
-  gm_mul<L, SOLO> (g, aX, t1, aZ, N, np0);     /* aX = CB */
-  gm_mul<L, SOLO> (g, t1, bZ, bX, N, np0);     /* t1 = DA */
-  gm_sqr<L, SOLO> (g, bZ, bX, N, np0);         /* bZ = AA */
-  gm_sqr<L, SOLO> (g, bX, aZ, N, np0);         /* bX = BB */
-  gm_sub<L, SOLO> (g, aZ, bZ, bX, N2);         /* aZ = K */
-  gm_mul<L, SOLO> (g, bZ, bZ, bX, N, np0);     /* bZ = AA*BB = new aX */
-  gm_mul_ui<L, SOLO> (g, t2, aZ, d, N, np0);   /* t2 = dK */
-  gm_add<L, SOLO> (g, bX, bX, t2);             /* bX = BB + dK */
-  gm_mul<L, SOLO> (g, aZ, aZ, bX, N, np0);     /* aZ = new aZ */
-  gm_add<L, SOLO> (g, bX, t1, aX);             /* bX = DA + CB */
-  gm_sub<L, SOLO> (g, t1, t1, aX, N2);         /* t1 = DA - CB */
-  gm_sqr<L, SOLO> (g, bX, bX, N, np0);         /* bX = new bX */
-  gm_sqr<L, SOLO> (g, t1, t1, N, np0);
-  gm_dbl<L, SOLO> (g, t1, t1);                 /* t1 = new bZ */
-
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    {
-      aX[k] = bZ[k];
-      bZ[k] = t1[k];
-    }
-}
-
-template<int L>
-__device__ __forceinline__ void
-swap_limbs (uint32_t (&a)[L], uint32_t (&b)[L])
-{
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    {
-      uint32_t t = a[k];
-      a[k] = b[k];
-      b[k] = t;
-    }
-}
-
-/* Process bits [b_start, b_start + b_count) of s, most significant first.
- * data holds, per curve, aX, aZ, bX, bZ (n limbs each, Montgomery form).
- * Every thread of the grid owns a real (or padding) curve: no early exits,
- * the shuffles need whole warps. */
-template<int L, bool SOLO>
-__global__ void __launch_bounds__ (GPU_TPB)
-gpu_stage1_kernel (const uint32_t * __restrict__ s_bits, uint64_t s_nbits,
-                   uint64_t b_start, uint64_t b_count,
-                   uint32_t * __restrict__ data,
-                   const uint32_t * __restrict__ Ng,
-                   uint32_t np0, uint32_t sigma0, uint32_t tpi)
-{
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
-
-  const uint32_t inst = (blockIdx.x * blockDim.x + threadIdx.x) / g.tpi;
-  const uint32_t n = g.tpi * L;
-  const uint32_t off = g.lane * L;
-
-  uint32_t N[L], N2[L], aX[L], aZ[L], bX[L], bZ[L];
-  uint32_t *dp = data + (size_t) inst * 4 * n + off;
-
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    {
-      N[k] = Ng[off + k];
-      aX[k] = dp[k];
-      aZ[k] = dp[n + k];
-      bX[k] = dp[2 * n + k];
-      bZ[k] = dp[3 * n + k];
-    }
-  gm_dbl<L, SOLO> (g, N2, N);
-
-  const uint32_t d = sigma0 + inst;
-
-  int swapped = 0;
-  for (uint64_t b = b_start; b < b_start + b_count; b++)
-    {
-      uint64_t nth = s_nbits - 1 - b;
-      int bit = (s_bits[nth >> 5] >> (nth & 31)) & 1;
-      if (bit != swapped)
-        {
-          swapped = bit;
-          swap_limbs<L> (aX, bX);
-          swap_limbs<L> (aZ, bZ);
-        }
-      ladder_step<L, SOLO> (g, aX, aZ, bX, bZ, d, N, N2, np0);
-    }
-  if (swapped)
-    {
-      swap_limbs<L> (aX, bX);
-      swap_limbs<L> (aZ, bZ);
-    }
-
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    {
-      dp[k] = aX[k];
-      dp[n + k] = aZ[k];
-      dp[2 * n + k] = bX[k];
-      dp[3 * n + k] = bZ[k];
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-
-typedef void (*gpu_kernel_fn) (const uint32_t *, uint64_t, uint64_t, uint64_t,
-                               uint32_t *, const uint32_t *,
-                               uint32_t, uint32_t, uint32_t);
-
-/* kernels[L] for L = 0..MAX_L (index 0 unused) */
-template<int L, bool SOLO>
-struct kernel_table {
-  static void fill (gpu_kernel_fn *t)
-  {
-    t[L] = gpu_stage1_kernel<L, SOLO>;
-    kernel_table<L - 1, SOLO>::fill (t);
-  }
-};
-template<bool SOLO>
-struct kernel_table<0, SOLO> {
-  static void fill (gpu_kernel_fn *t) { t[0] = NULL; }
-};
-
-static gpu_kernel_fn
-get_kernel (uint32_t tpi, uint32_t L)
-{
-  static gpu_kernel_fn solo[GPU_SOLO_MAX_L + 1];
-  static gpu_kernel_fn dist[GPU_DIST_MAX_L + 1];
-  static int init = 0;
-  if (!init)
-    {
-      kernel_table<GPU_SOLO_MAX_L, true>::fill (solo);
-      kernel_table<GPU_DIST_MAX_L, false>::fill (dist);
-      init = 1;
-    }
-  if (tpi == 1)
-    return (L >= 1 && L <= GPU_SOLO_MAX_L) ? solo[L] : NULL;
-  return (L >= 1 && L <= GPU_DIST_MAX_L) ? dist[L] : NULL;
-}
 
 struct gpu_plan_t {
   uint32_t n_min;        /* key: minimal limb count */
   uint32_t req_curves;   /* key: requested curves (0 = fill GPU) */
   uint32_t tpi, L;
   uint32_t curves;
-  gpu_kernel_fn fn;
+  gpu_s1_fn fn;
 };
 
 static std::vector<gpu_plan_t> plans;
@@ -243,11 +85,12 @@ round_up (uint32_t a, uint32_t m)
 static void
 launch (const gpu_plan_t &p, uint32_t padded, const uint32_t *gpu_s_bits,
         uint64_t s_nbits, uint64_t start, uint64_t count, uint32_t *gpu_data,
-        const uint32_t *gpu_N, uint32_t np0, uint32_t sigma)
+        const uint32_t *gpu_N, uint32_t np0, uint32_t sigma,
+        const uint32_t *gpu_dlist = NULL, const uint32_t *gpu_x0 = NULL)
 {
   uint32_t blocks = padded * p.tpi / GPU_TPB;
   p.fn<<<blocks, GPU_TPB>>> (gpu_s_bits, s_nbits, start, count, gpu_data,
-                             gpu_N, np0, sigma, p.tpi);
+                             gpu_N, np0, sigma, p.tpi, gpu_dlist, gpu_x0);
   CUDA_CHECK (cudaGetLastError ());
 }
 
@@ -259,7 +102,7 @@ padded_curves (const gpu_plan_t &p, uint32_t curves)
 
 /* Curves needed to fill the GPU with kernel FN at TPI threads per curve. */
 static uint32_t
-fill_curves (gpu_kernel_fn fn, uint32_t tpi)
+fill_curves (gpu_s1_fn fn, uint32_t tpi)
 {
   int device, sms, blocks = 0;
   CUDA_CHECK (cudaGetDevice (&device));
@@ -330,6 +173,15 @@ time_plan (const gpu_plan_t &p, uint32_t n_min)
 }
 
 extern "C"
+void
+gpu_ecm_plan_shape (int config, uint32_t *tpi, uint32_t *L)
+{
+  assert (config >= 0 && (size_t) config < plans.size ());
+  *tpi = plans[config].tpi;
+  *L = plans[config].L;
+}
+
+extern "C"
 size_t
 gpu_ecm_stage1_max_bits (void)
 {
@@ -380,7 +232,8 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
         }
       else if (tpi > 1 && L < 2 && n_min > 1)
         continue;   /* never better than fewer threads with more limbs */
-      gpu_kernel_fn fn = get_kernel (tpi, L);
+      const gpu_kernel_set *ks = gpu_kernels (tpi, L);
+      gpu_s1_fn fn = ks != NULL ? ks->s1 : NULL;
       if (fn == NULL)
         continue;
       gpu_plan_t p;
@@ -427,37 +280,6 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
 
 /* ---------------------------------------------------------------------- */
 
-static void
-to_limbs (uint32_t *x, uint32_t n, const mpz_t s)
-{
-  size_t words = 0;
-  assert (mpz_sgn (s) >= 0 && mpz_sizeinbase (s, 2) <= 32 * (size_t) n);
-  mpz_export (x, &words, -1, sizeof (uint32_t), 0, 0, s);
-  while (words < n)
-    x[words++] = 0;
-}
-
-static void
-from_limbs (mpz_t r, const uint32_t *x, uint32_t n)
-{
-  mpz_import (r, n, -1, sizeof (uint32_t), 0, 0, x);
-}
-
-static uint32_t
-find_np0 (const mpz_t N)
-{
-  uint32_t np0;
-  mpz_t t;
-  mpz_init (t);
-  mpz_ui_pow_ui (t, 2, 32);
-  int ok = mpz_invert (t, N, t);
-  assert (ok);
-  (void) ok;
-  np0 = - (uint32_t) mpz_get_ui (t);
-  mpz_clear (t);
-  return np0;
-}
-
 static int
 print_nth_batch (int n)
 {
@@ -472,11 +294,11 @@ extern "C"
 int
 gpu_ecm_stage1 (mpz_t *factors, int *array_found,
                 const mpz_t N, const mpz_t s,
-                uint32_t curves, uint32_t sigma, int config,
-                float *gputime, int verbose)
+                uint32_t curves, uint32_t sigma, const uint32_t *sigmas,
+                int from_x, int config, float *gputime, int verbose)
 {
   assert (sigma > 0);
-  assert (((uint64_t) sigma + curves) <= 0xFFFFFFFF);
+  assert (sigmas != NULL || ((uint64_t) sigma + curves) <= 0xFFFFFFFF);
   assert (config >= 0 && (size_t) config < plans.size ());
   const gpu_plan_t &p = plans[config];
 
@@ -506,54 +328,109 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
     assert (cnt == s_words);
   }
 
-  /* Initial points in Montgomery form (R = 2^(32n)):
+#define CURVE_SIGMA(i) (sigmas != NULL ? sigmas[(i) < curves ? (i) : 0] \
+                                       : sigma + (i))
+
+  /* Initial points in Montgomery form (R = 2^(32n)), with
+   * a24 = d = sigma_i / 2^32 mod N:
    *   P  = (2 : 1)
-   *   2P = (9 : 64 d + 8), d = sigma_i / 2^32 mod N   */
+   *   2P = (9 : 64 d + 8)
+   * or, for a resumed curve (from_x), P = (x0 : 1) with x0 = factors[i] and
+   *   2P = ((x0+1)^2 (x0-1)^2 : 4 x0 ((x0-1)^2 + 4 d x0)),
+   * the ladder's doubling.  Then the kernel also needs x0 itself, which is
+   * the difference in every ladder step. */
   size_t data_words = (size_t) padded * 4 * n;
   uint32_t *data = (uint32_t *) malloc (data_words * sizeof (uint32_t));
+  uint32_t *x0limbs = NULL;
+  uint32_t *dlist = NULL;
   assert (data != NULL);
+  if (from_x)
+    {
+      x0limbs = (uint32_t *) malloc ((size_t) padded * n * sizeof (uint32_t));
+      assert (x0limbs != NULL);
+    }
+  if (sigmas != NULL)
+    {
+      dlist = (uint32_t *) malloc (padded * sizeof (uint32_t));
+      assert (dlist != NULL);
+      for (uint32_t i = 0; i < padded; i++)
+        dlist[i] = CURVE_SIGMA (i);
+    }
   {
-    mpz_t R, x, inv32;
+    mpz_t R, x, inv32, d, a, b, c;
     mpz_init (R);
     mpz_init (x);
     mpz_init (inv32);
+    mpz_init (d);
+    mpz_init (a);
+    mpz_init (b);
+    mpz_init (c);
     mpz_setbit (R, 32 * (size_t) n);
     mpz_mod (R, R, N);
     mpz_ui_pow_ui (inv32, 2, 32);
     mpz_invert (inv32, inv32, N);
 
-    mpz_mul_ui (x, R, 2);
-    mpz_mod (x, x, N);
-    uint32_t *P0 = data;
-    to_limbs (P0, n, x);                 /* aX */
-    to_limbs (P0 + n, n, R);             /* aZ */
-    mpz_mul_ui (x, R, 9);
-    mpz_mod (x, x, N);
-    to_limbs (P0 + 2 * n, n, x);         /* bX */
-
     for (uint32_t i = 0; i < padded; i++)
       {
         uint32_t *dp = data + (size_t) i * 4 * n;
-        if (i > 0)
-          memcpy (dp, P0, 3 * n * sizeof (uint32_t));
-        mpz_mul_ui (x, inv32, sigma + i);
-        mpz_mul_ui (x, x, 64);
-        mpz_add_ui (x, x, 8);
-        mpz_mod (x, x, N);
-        if (i == 0)
-          outputf (OUTPUT_TRACE, "sigma %u => P2_z: %Zd\n", sigma, x);
-        mpz_mul (x, x, R);
-        mpz_mod (x, x, N);
-        to_limbs (dp + 3 * n, n, x);     /* bZ */
+        mpz_mul_ui (d, inv32, CURVE_SIGMA (i));
+        mpz_mod (d, d, N);
+        if (from_x)
+          {
+            mpz_mod (x, factors[i < curves ? i : 0], N);
+            mpz_add_ui (a, x, 1);
+            mpz_mul (a, a, a);                    /* A = (x0+1)^2 */
+            mpz_sub_ui (b, x, 1);
+            mpz_mul (b, b, b);                    /* B = (x0-1)^2 */
+            mpz_sub (c, a, b);                    /* C = A - B */
+            mpz_mul (a, a, b);
+            mpz_mul (a, a, R);
+            mpz_mod (a, a, N);
+            gpu_to_limbs (dp + 2 * n, n, a);      /* bX = A B */
+            mpz_mul (a, d, c);
+            mpz_add (a, a, b);
+            mpz_mul (a, a, c);
+            mpz_mod (a, a, N);
+            mpz_mul (a, a, R);
+            mpz_mod (a, a, N);
+            gpu_to_limbs (dp + 3 * n, n, a);      /* bZ = C (B + d C) */
+            mpz_mul (x, x, R);
+            mpz_mod (x, x, N);
+            gpu_to_limbs (dp, n, x);              /* aX */
+            gpu_to_limbs (x0limbs + (size_t) i * n, n, x);
+          }
+        else
+          {
+            mpz_mul_ui (x, R, 2);
+            mpz_mod (x, x, N);
+            gpu_to_limbs (dp, n, x);              /* aX */
+            mpz_mul_ui (x, R, 9);
+            mpz_mod (x, x, N);
+            gpu_to_limbs (dp + 2 * n, n, x);      /* bX */
+            mpz_mul_ui (x, d, 64);
+            mpz_add_ui (x, x, 8);
+            mpz_mod (x, x, N);
+            if (i == 0)
+              outputf (OUTPUT_TRACE, "sigma %u => P2_z: %Zd\n",
+                       CURVE_SIGMA (0), x);
+            mpz_mul (x, x, R);
+            mpz_mod (x, x, N);
+            gpu_to_limbs (dp + 3 * n, n, x);      /* bZ */
+          }
+        gpu_to_limbs (dp + n, n, R);              /* aZ */
       }
     mpz_clear (R);
     mpz_clear (x);
     mpz_clear (inv32);
+    mpz_clear (d);
+    mpz_clear (a);
+    mpz_clear (b);
+    mpz_clear (c);
   }
 
   uint32_t *Nlimbs = (uint32_t *) malloc (n * sizeof (uint32_t));
-  to_limbs (Nlimbs, n, N);
-  uint32_t np0 = find_np0 (N);
+  gpu_to_limbs (Nlimbs, n, N);
+  uint32_t np0 = gpu_find_np0 (N);
 
   cudaEvent_t global_start, batch_start, stop;
   CUDA_CHECK (cudaEventCreate (&global_start));
@@ -573,6 +450,19 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
   CUDA_CHECK (cudaMalloc ((void **) &gpu_data, data_words * sizeof (uint32_t)));
   CUDA_CHECK (cudaMemcpy (gpu_data, data, data_words * sizeof (uint32_t),
                           cudaMemcpyHostToDevice));
+  uint32_t *gpu_dlist = NULL, *gpu_x0 = NULL;
+  if (dlist != NULL)
+    {
+      CUDA_CHECK (cudaMalloc ((void **) &gpu_dlist, padded * sizeof (uint32_t)));
+      CUDA_CHECK (cudaMemcpy (gpu_dlist, dlist, padded * sizeof (uint32_t),
+                              cudaMemcpyHostToDevice));
+    }
+  if (x0limbs != NULL)
+    {
+      size_t bytes = (size_t) padded * n * sizeof (uint32_t);
+      CUDA_CHECK (cudaMalloc ((void **) &gpu_x0, bytes));
+      CUDA_CHECK (cudaMemcpy (gpu_x0, x0limbs, bytes, cudaMemcpyHostToDevice));
+    }
 
   kernel_info ((const void *) p.fn, verbose);
   outputf (OUTPUT_VERBOSE, "GPU: %u-bit arithmetic (TPI=%u, L=%u), "
@@ -582,14 +472,15 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
 
   /* The first bit (doubling) is handled by the initial 2P. */
   uint64_t s_partial = 1;
-  /* Start with small batches and increase till timing is ~100ms */
-  uint64_t batch_size = 200;
+  /* Start with small batches and increase till timing is ~100ms: at the
+     largest sizes a bit takes milliseconds */
+  uint64_t batch_size = 16, want = batch_size;
   int batches_complete = 0;
-  float batch_time = 0;
+  float batch_time = 0, max_time = 0;
 
   while (s_partial < s_nbits)
     {
-      batch_size = std::min (s_nbits - s_partial, batch_size);
+      batch_size = std::min (s_nbits - s_partial, want);
 
       if (print_nth_batch (batches_complete))
         {
@@ -610,7 +501,7 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
 
       CUDA_CHECK (cudaEventRecord (batch_start));
       launch (p, padded, gpu_s_bits, s_nbits, s_partial, batch_size,
-              gpu_data, gpu_N, np0, sigma);
+              gpu_data, gpu_N, np0, sigma, gpu_dlist, gpu_x0);
 
       s_partial += batch_size;
       batches_complete++;
@@ -619,14 +510,12 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
       CUDA_CHECK (cudaEventSynchronize (stop));
       cudaEventElapsedTime (&batch_time, batch_start, stop);
       cudaEventElapsedTime (gputime, global_start, stop);
-      /* Adjust batch_size to aim for 100ms */
-      if (batch_time < 80)
-        batch_size = 11 * batch_size / 10;
-      else if (batch_time > 120)
-        batch_size = std::max ((uint64_t) 100, 9 * batch_size / 10);
+      max_time = std::max (max_time, batch_time);
+      want = gpu_pace (want, batch_size, batch_time, batch_size < want);
     }
 
-  outputf (OUTPUT_VERBOSE, "Copying results back to CPU ...\n");
+  outputf (OUTPUT_VERBOSE, "Copying results back to CPU (longest launch "
+           "%.0f ms) ...\n", max_time);
   CUDA_CHECK (cudaMemcpy (data, gpu_data, data_words * sizeof (uint32_t),
                           cudaMemcpyDeviceToHost));
   cudaEventElapsedTime (gputime, global_start, stop);
@@ -645,8 +534,8 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
     for (uint32_t i = 0; i < curves; i++)
       {
         const uint32_t *dp = data + (size_t) i * 4 * n;
-        from_limbs (x, dp, n);
-        from_limbs (z, dp + n, n);
+        gpu_from_limbs (x, dp, n);
+        gpu_from_limbs (z, dp + n, n);
         mpz_mul (x, x, Rinv);
         mpz_mod (x, x, N);
         mpz_mul (z, z, Rinv);
@@ -656,7 +545,7 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
           outputf (OUTPUT_TRACE, "index: 0 pA: (%Zd, %Zd)\n", x, z);
 
         /* (2 : 1) is the starting point: the kernel didn't run */
-        if (mpz_cmp_ui (x, 2) == 0 && mpz_cmp_ui (z, 1) == 0)
+        if (!from_x && mpz_cmp_ui (x, 2) == 0 && mpz_cmp_ui (z, 1) == 0)
           {
             errors += 1;
             if (errors < 10 || errors % 100 == 1)
@@ -676,7 +565,7 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
             youpi = ECM_FACTOR_FOUND_STEP1;
             outputf (OUTPUT_NORMAL, "GPU: factor %Zd found in Step 1 with "
                      "curve %u (-sigma %d:%u)\n", factors[i], i,
-                     ECM_PARAM_BATCH_32BITS_D, sigma + i);
+                     ECM_PARAM_BATCH_32BITS_D, CURVE_SIGMA (i));
           }
       }
     mpz_clear (x);
@@ -693,8 +582,14 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
   CUDA_CHECK (cudaEventDestroy (batch_start));
   CUDA_CHECK (cudaEventDestroy (stop));
 
+  if (gpu_dlist != NULL)
+    CUDA_CHECK (cudaFree (gpu_dlist));
+  if (gpu_x0 != NULL)
+    CUDA_CHECK (cudaFree (gpu_x0));
   free (s_bits);
   free (data);
+  free (dlist);
+  free (x0limbs);
   free (Nlimbs);
 
   return youpi;

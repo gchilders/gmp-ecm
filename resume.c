@@ -645,8 +645,18 @@ write_resumefile (char *fn, int method, ecm_params params,
       ASSERT_ALWAYS (mpz_cmp(orig_n, n->n) == 0 || mpz_divisible_p(orig_n, n->n));
 
       size_t n_bits = mpz_sizeinbase(orig_n, 2);
+      /* A resumed GPU batch carries its sigmas in params->y, 32 bits each
+         (see gpu_ecm); otherwise they are consecutive from params->sigma. */
+      int sigma_list = mpz_sgn (params->y) > 0;
+      mpz_t sigma_list_rest;
+      mpz_init_set (sigma_list_rest, params->y);
       for (i = 0; i < params->gpu_number_of_curves; i++)
         {
+          if (sigma_list)
+            {
+              mpz_fdiv_r_2exp (params->sigma, sigma_list_rest, 32);
+              mpz_fdiv_q_2exp (sigma_list_rest, sigma_list_rest, 32);
+            }
           mpz_fdiv_r_2exp (tmp_x, params->x, n_bits);
           mpz_fdiv_q_2exp (params->x, params->x, n_bits);
           mpz_mod (tmp_x, tmp_x, n->n);
@@ -655,11 +665,17 @@ write_resumefile (char *fn, int method, ecm_params params,
                                  /* since the gpu version always uses -param 3,
                                     we hardcode it in the save file */
 				 ECM_PARAM_BATCH_32BITS_D,
-				 tmp_x, NULL, n, orig_x0, orig_y0, 
+				 tmp_x, NULL, n, orig_x0, orig_y0,
 				 comment);
-          mpz_add_ui (params->sigma, params->sigma, 1);
+          if (!sigma_list)
+            mpz_add_ui (params->sigma, params->sigma, 1);
         }
-      mpz_sub_ui (params->sigma, params->sigma, params->gpu_number_of_curves);
+      if (sigma_list)
+        mpz_fdiv_r_2exp (params->sigma, params->y, 32);
+      else
+        mpz_sub_ui (params->sigma, params->sigma,
+                    params->gpu_number_of_curves);
+      mpz_clear (sigma_list_rest);
     }
 
   /* closing the file */
