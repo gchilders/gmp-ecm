@@ -56,6 +56,7 @@ if WANT_GPU
   libecm_la_SOURCES += cudacommon.cu
   libecm_la_SOURCES += gpu_stage1.cu
   libecm_la_SOURCES += gpu_stage2.cu gpu_ntt.cu gpu_kernels.cu \
+                       gpu_rns.cu gpu_polyalg.cu gpu_roots.cu gpu_s2poly.cu \
                        gpu_kset_00.cu gpu_kset_01.cu gpu_kset_02.cu gpu_kset_03.cu gpu_kset_04.cu gpu_kset_05.cu gpu_kset_06.cu gpu_kset_07.cu gpu_kset_08.cu gpu_kset_09.cu gpu_kset_10.cu gpu_kset_11.cu gpu_kset_12.cu gpu_kset_13.cu
   libecm_la_LIBADD += $(CUDALIB)
   libecm_la_LDFLAGS += $(CUDALDFLAGS)
@@ -113,6 +114,7 @@ noinst_HEADERS = basicdefs.h ecm-impl.h ecm-gmp.h ecm-ecm.h sp.h longlong.h \
                  cudacommon.h gpu_stage1.h gpu_stage2.h gpu_mont.cuh gpu_common.cuh \
                  gpu_kernels.h gpu_kset.cuh gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh \
                  gpu_ntt.h gpu_ntt.cuh \
+                 gpu_rns.h gpu_polyalg.h gpu_roots.h gpu_s2poly.h \
                  addlaws.h getprime_r.h ecm_int.h \
                  aprtcle/mpz_aprcl.h aprtcle/jacobi_sum.h
 
@@ -142,6 +144,10 @@ gpu_stage1.lo: gpu_stage1.h gpu_kernels.h gpu_ntt.h gpu_common.cuh cudacommon.h 
 gpu_ntt.lo: gpu_ntt.h gpu_ntt.cuh gpu_common.cuh cudacommon.h
 gpu_stage2.lo: gpu_stage1.h gpu_stage2.h gpu_kernels.h gpu_ntt.h gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh cudacommon.h ecm.h ecm-gpu.h getprime_r.h
 gpu_kernels.lo: gpu_kernels.h gpu_common.cuh
+gpu_rns.lo: gpu_rns.h cudacommon.h
+gpu_polyalg.lo: gpu_polyalg.h gpu_rns.h cudacommon.h
+gpu_roots.lo: gpu_roots.h gpu_mont.cuh gpu_common.cuh cudacommon.h
+gpu_s2poly.lo: gpu_s2poly.h gpu_rns.h gpu_polyalg.h gpu_roots.h gpu_common.cuh cudacommon.h ecm.h ecm-gpu.h
 gpu_kset_00.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 gpu_kset_01.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 gpu_kset_02.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh

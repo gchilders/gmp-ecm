@@ -6,6 +6,7 @@
 
 #include "gpu_stage1.h"
 #include "gpu_stage2.h"
+#include "gpu_s2poly.h"
 
 
 #define TWO32 4294967296 /* 2^32 */
@@ -191,7 +192,10 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   unsigned int nb_curves = 0; /* Local copy of number of curves */
   int gpu_config;             /* Kernel configuration from gpu_ecm_stage1_plan */
   int gpu_stage2;             /* Do stage 2 on the GPU too? */
+  int gpu_poly;               /* ... with the polynomial continuation? */
   mpz_t B2_parm;              /* B2 as given, or the GPU stage 2 default */
+  unsigned long k_parm = params->k;   /* k as given */
+  mpz_t *As = NULL;           /* curve parameters for the polynomial one */
   /* A resumed batch (B1done set): params->x holds the saved residues and
      params->y their sigmas, packed as main.c's gpu_resume_batch does. */
   int resume = !ECM_IS_DEFAULT_B1_DONE (params->B1done);
@@ -284,37 +288,43 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   mpz_init (B2);
   mpz_init (B2min);
 
-  /* params->gpu == 1: stage 2 on the GPU too; 2: stage 2 on the CPU.
-     GPU stage 2 costs time linear in B2, so its default B2 is a fixed
-     multiple of B1 rather than the CPU's (much larger) default. */
-  gpu_stage2 = (params->gpu == 1);
+  /* params->gpu == 1: stage 2 on the GPU too (baby-step giant-step); 2:
+     stage 2 on the CPU; 3: the polynomial stage 2 on the GPU.  The
+     baby-step giant-step stage 2 costs time linear in B2, so its default
+     B2 is a fixed multiple of B1 rather than the CPU's (much larger)
+     default.  The polynomial one takes GMP-ECM's own parameters, with
+     the power-of-2 dF of its NTT stage 2. */
+  gpu_poly = (params->gpu == 3);
+  gpu_stage2 = (params->gpu == 1 || gpu_poly);
   mpz_init_set (B2_parm, params->B2);
-  if (gpu_stage2 && !ECM_IS_DEFAULT_B2 (B2_parm)
+  if (gpu_stage2 && !gpu_poly && !ECM_IS_DEFAULT_B2 (B2_parm)
       && mpz_sizeinbase (B2_parm, 2) > 62)
     {
       outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (B2 above 2^62 is too "
                "large for GPU stage 2)\n");
       gpu_stage2 = 0;
     }
-  if (gpu_stage2 && ECM_IS_DEFAULT_B2 (B2_parm))
+  if (gpu_stage2 && !gpu_poly && ECM_IS_DEFAULT_B2 (B2_parm))
     mpz_set_d (B2_parm, GPU_STAGE2_DEFAULT_B2_FACTOR * B1);
 
   youpi = set_stage_2_params (
           B2, B2_parm,
           B2min, params->B2min,
           &root_params,
-          B1, &mutable_params->k, params->S, params->use_ntt, &po2, &dF,
-                              params->TreeFilename, params->maxmem, Fermat, modulus);
-  if (gpu_stage2)
+          B1, &mutable_params->k, params->S, gpu_poly ? 1 : params->use_ntt,
+          &po2, &dF, params->TreeFilename, params->maxmem, Fermat, modulus);
+  if (gpu_stage2 && !gpu_poly)
     {
       /* the GPU continuation covers exactly the primes in (B2min, B2], with
          no Brent-Suyama extension */
       mpz_set (B2, B2_parm);
       root_params.S = 1;
     }
-  mpz_clear (B2_parm);
   if (youpi == ECM_ERROR)
+    {
+      mpz_clear (B2_parm);
       goto end_gpu_ecm;
+    }
 
   /* Initialize the GPU if necessary and determine nb_curves.  The
      initialization rounds a requested curve count up, which must not
@@ -361,7 +371,45 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
 
   /* GPU stage 2 has kernels for every stage 1 configuration that the
      planner picks; a forced one without them gets stage 2 on the CPU. */
-  if (gpu_stage2 && !gpu_ecm_stage2_supported (gpu_config))
+  if (gpu_poly && mpz_cmp (B2, B2min) >= 0)
+    {
+      /* the largest dF (a power of 2, as GMP-ECM's are with use_ntt) that
+         fits the GPU; a smaller one means GMP-ECM's parameters again with
+         a memory limit */
+      unsigned long fit = gpu_ecm_stage2_poly_fit (n, dF);
+      if (fit == 0)
+        {
+          outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (no polynomial "
+                   "GPU stage 2 for this size)\n");
+          gpu_stage2 = gpu_poly = 0;
+        }
+      else if (fit < dF)
+        {
+          int lg = ceil_log2 (fit);
+          double mm = memory_use (fit, (2 * mpz_sizeinbase (n, 2) + lg)
+                                       / SP_NUMB_BITS + 4, lg, modulus);
+          mpz_clear (root_params.i0);
+          mutable_params->k = k_parm;
+          youpi = set_stage_2_params (B2, B2_parm, B2min, params->B2min,
+                                      &root_params, B1, &mutable_params->k,
+                                      params->S, 1, &po2, &dF,
+                                      params->TreeFilename, mm * 1.000001,
+                                      Fermat, modulus);
+          if (youpi == ECM_ERROR || dF > fit)
+            {
+              outputf (OUTPUT_ERROR, "GPU: Error, cannot fit stage 2 in "
+                       "the GPU memory\n");
+              youpi = ECM_ERROR;
+              mpz_clear (B2_parm);
+              goto end_gpu_ecm;
+            }
+          outputf (OUTPUT_VERBOSE, "GPU: dF lowered to %lu to fit the GPU "
+                   "memory\n", dF);
+        }
+    }
+  mpz_clear (B2_parm);
+
+  if (gpu_stage2 && !gpu_poly && !gpu_ecm_stage2_supported (gpu_config))
     {
       outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (no GPU stage 2 "
                "kernel for this configuration)\n");
@@ -537,9 +585,28 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
     {
       float gputime2 = 0;
       st2 = cputime ();
-      youpi = gpu_ecm_stage2 (factors, array_found, n, B2min, B2, nb_curves,
-                              firstsigma_ui, sigmas, gpu_config, &gputime2,
-                              params->verbose);
+      if (gpu_poly)
+        {
+          As = (mpz_t *) malloc (nb_curves * sizeof (mpz_t));
+          ASSERT_ALWAYS (As != NULL);
+          for (i = 0; i < nb_curves; i++)
+            {
+              mpz_init (As[i]);
+              A_from_sigma (As[i], CURVE_SIGMA (i), modulus->orig_modulus);
+            }
+          youpi = gpu_ecm_stage2_poly (factors, array_found, As, n,
+                                       root_params.S, root_params.d1,
+                                       root_params.d2, root_params.i0, dF,
+                                       params->k, nb_curves, &gputime2,
+                                       params->verbose);
+          for (i = 0; i < nb_curves; i++)
+            mpz_clear (As[i]);
+          free (As);
+        }
+      else
+        youpi = gpu_ecm_stage2 (factors, array_found, n, B2min, B2,
+                                nb_curves, firstsigma_ui, sigmas, gpu_config,
+                                &gputime2, params->verbose);
       if (youpi == ECM_ERROR)
         goto end_gpu_ecm_factors;
       for (i = 0; i < nb_curves; i++)

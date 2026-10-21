@@ -144,6 +144,26 @@ checkcode $? 14
 checkfactorcount test.gpuecm.out 0 3 1
 rm -f test.gpuecm.out
 
+# the polynomial GPU stage 2 (GMP-ECM's own stage 2, effective B2 = 225426
+# here) finds it with the same curves as the CPU's
+echo "(2^40-87)*(2^521-1)" | $ECM -gpupoly -sigma 3:1224 4000 200000 > test.gpuecm.out
+checkcode $? 14
+checkfactorcount test.gpuecm.out 0 3 1
+rm -f test.gpuecm.out
+
+# and computes GMP-ECM's numbers: the same "Product of G(f_i)" for every
+# curve as the CPU's stage 2 (a 300-bit semiprime p q)
+N300=1173661076830816293051206570571444274752685904788085517064150791038394170421547544691602351
+echo $N300 | $ECM -gpupoly -sigma 3:1000 -v -v -v 20000 | grep "Product of G" > test.gpuecm.p1
+echo $N300 | $ECM -cpustage2 -sigma 3:1000 -v -v -v -v 20000 | grep "Product of G" > test.gpuecm.p2
+if [ $(grep -c . test.gpuecm.p1) != 32 ] || ! cmp -s test.gpuecm.p1 test.gpuecm.p2
+then
+  echo "############### ERROR ###############"
+  echo "GPU polynomial stage 2 values differ from the CPU's"
+  exit 1
+fi
+rm -f test.gpuecm.p1 test.gpuecm.p2
+
 # test -v option
 $ECM -v 1e3 < ${GMPECM_DATADIR}/c155
 checkcode $? 0

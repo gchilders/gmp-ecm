@@ -98,6 +98,18 @@ continuation and the usual default B2), add "-cpustage2":
 
   $ echo "(2^835+1)/33" | ./ecm -gpu -cpustage2 1e4
 
+"-gpupoly" (instead of "-gpu") runs that FFT continuation on the GPU: the
+same polynomials and the same numbers as GMP-ECM's stage 2 on the CPU
+(the same "Product of G(f_i)" at -v -v -v, the same factors), with its
+default B2 and Brent-Suyama polynomial, curve by curve.  It always uses the
+parameters of GMP-ECM's NTT stage 2 (dF a power of 2), lowered if needed to
+fit the GPU memory; to compare with the CPU above 1920 bits, give the CPU
+run "-ntt".  It takes inputs up to 24572 bits; above that, or without enough
+GPU memory, step 2 runs on the CPU.  It is not yet tuned (curves are not
+batched), and not yet the default.
+
+  $ echo "(2^835+1)/33" | ./ecm -gpupoly 1e6
+
 The only parametrization compatible with GPU code is "-param 3".
 
 You can save the end of step 1 with "-save" and resume it later, on the GPU
