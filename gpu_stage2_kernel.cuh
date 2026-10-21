@@ -27,12 +27,6 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include "gpu_common.cuh"
 #include "gpu_mont.cuh"
 
-/* state slots.  AUX holds 2Q during setup and the running product of the
-   Z's while the baby steps are put on a shared denominator; BZ holds that
-   denominator. */
-enum { S_PREV_X, S_PREV_Z, S_CUR_X, S_CUR_Z, S_DQ_X, S_DQ_Z, S_ACC, S_BZ,
-       S_AUX_X, S_AUX_Z, S_COUNT };
-
 template<int L>
 __device__ __forceinline__ void
 s2_load (uint32_t (&x)[L], const uint32_t * __restrict__ buf, uint32_t s,
@@ -63,9 +57,9 @@ s2_copy (uint32_t (&r)[L], const uint32_t (&a)[L])
 }
 
 /* (X : Z) = 2 (X1 : Z1).  Inputs < 2N, outputs < 2N.  May alias. */
-template<int L, bool SOLO>
+template<int L, bool SOLO, class G>
 __device__ __forceinline__ void
-xdbl (const gm_group &g, uint32_t (&X)[L], uint32_t (&Z)[L],
+xdbl (const G &g, uint32_t (&X)[L], uint32_t (&Z)[L],
       const uint32_t (&X1)[L], const uint32_t (&Z1)[L], uint32_t d,
       const uint32_t (&N)[L], const uint32_t (&N2)[L], uint32_t np0)
 {
@@ -83,9 +77,9 @@ xdbl (const gm_group &g, uint32_t (&X)[L], uint32_t (&Z)[L],
 
 /* (X : Z) = P + Q given D = P - Q.  Inputs < 2N, outputs < 2N.  The output
    may alias P or Q but not D. */
-template<int L, bool SOLO>
+template<int L, bool SOLO, class G>
 __device__ __forceinline__ void
-xadd (const gm_group &g, uint32_t (&X)[L], uint32_t (&Z)[L],
+xadd (const G &g, uint32_t (&X)[L], uint32_t (&Z)[L],
       const uint32_t (&XP)[L], const uint32_t (&ZP)[L],
       const uint32_t (&XQ)[L], const uint32_t (&ZQ)[L],
       const uint32_t (&XD)[L], const uint32_t (&ZD)[L],
@@ -134,20 +128,18 @@ xadd (const gm_group &g, uint32_t (&X)[L], uint32_t (&Z)[L],
  * nodd + 1: G_2 = 2 DQ.  This launch does steps [STEP0, STEP1); NEXT0 is the
  * index in JLIST of the first baby step not yet stored (the host counts it).
  * Between launches, cur = jQ, prev = (j-2)Q, Q2 and DQ live in STATE. */
-template<int L, bool SOLO>
-__global__ void __launch_bounds__ (GPU_TPB, 1)
-s2_setup_kernel (const uint32_t * __restrict__ xin,
-                 const uint32_t * __restrict__ Ng,
-                 const uint32_t * __restrict__ oneg,
-                 uint32_t np0, uint32_t sigma0, uint32_t tpi,
-                 uint32_t halfD, const uint32_t * __restrict__ jlist,
-                 uint32_t nbaby,
-                 uint32_t * __restrict__ baby, uint32_t * __restrict__ state,
-                 uint32_t step0, uint32_t step1, uint32_t next0,
-                 const uint32_t * __restrict__ dlist)
+template<int L, bool SOLO, class G>
+__device__ __forceinline__ void
+s2_setup_body (const G &g, const uint32_t * __restrict__ xin,
+               const uint32_t * __restrict__ Ng,
+               const uint32_t * __restrict__ oneg,
+               uint32_t np0, uint32_t sigma0,
+               uint32_t halfD, const uint32_t * __restrict__ jlist,
+               uint32_t nbaby,
+               uint32_t * __restrict__ baby, uint32_t * __restrict__ state,
+               uint32_t step0, uint32_t step1, uint32_t next0,
+               const uint32_t * __restrict__ dlist)
 {
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
   const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t T = gridDim.x * blockDim.x;
   const uint32_t inst = t / g.tpi;
@@ -263,21 +255,57 @@ s2_setup_kernel (const uint32_t * __restrict__ xin,
   s2_store<L> (state, DZ, S_DQ_Z, T, t);
 }
 
+template<int L, bool SOLO>
+__global__ void __launch_bounds__ (GPU_TPB, 1)
+s2_setup_kernel (const uint32_t * __restrict__ xin,
+                 const uint32_t * __restrict__ Ng,
+                 const uint32_t * __restrict__ oneg,
+                 uint32_t np0, uint32_t sigma0, uint32_t tpi,
+                 uint32_t halfD, const uint32_t * __restrict__ jlist,
+                 uint32_t nbaby,
+                 uint32_t * __restrict__ baby, uint32_t * __restrict__ state,
+                 uint32_t step0, uint32_t step1, uint32_t next0,
+                 const uint32_t * __restrict__ dlist)
+{
+  gm_group g;
+  g.init (SOLO ? 1 : tpi);
+  s2_setup_body<L, SOLO> (g, xin, Ng, oneg, np0, sigma0, halfD, jlist, nbaby,
+                          baby, state, step0, step1, next0, dlist);
+}
+
+/* wide groups (64 or 128 threads per curve) */
+template<int L>
+__global__ void __launch_bounds__ (GPU_TPB, 1)
+s2_setup_wide_kernel (const uint32_t * __restrict__ xin,
+                      const uint32_t * __restrict__ Ng,
+                      const uint32_t * __restrict__ oneg,
+                      uint32_t np0, uint32_t sigma0, uint32_t tpi,
+                      uint32_t halfD, const uint32_t * __restrict__ jlist,
+                      uint32_t nbaby,
+                      uint32_t * __restrict__ baby, uint32_t * __restrict__ state,
+                      uint32_t step0, uint32_t step1, uint32_t next0,
+                      const uint32_t * __restrict__ dlist)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  s2_setup_body<L, false> (g, xin, Ng, oneg, np0, sigma0, halfD, jlist,
+                           nbaby, baby, state, step0, step1, next0, dlist);
+}
+
 /* Put the baby steps on the shared denominator, iterations [I0, I1) of
  * 2 nbaby.  Forward, i = b < nbaby: bx_b = X_b prod_{c<b} Z_c, with the
  * running product in AUX_X; it ends at BZ = prod Z_c.  Backward,
  * i = 2 nbaby - 1 - b: bx_b *= prod_{c>b} Z_c.  The products by 1 at the
  * start of each pass, and the backward pass's last update of the running
  * product, are skipped. */
-template<int L, bool SOLO>
-__global__ void __launch_bounds__ (GPU_TPB, 1)
-s2_norm_kernel (uint32_t * __restrict__ baby, uint32_t nbaby,
-                uint32_t * __restrict__ state,
-                const uint32_t * __restrict__ Ng, uint32_t np0,
-                uint32_t tpi, uint32_t i0, uint32_t i1)
+template<int L, bool SOLO, class G>
+__device__ __forceinline__ void
+s2_norm_body (const G &g, uint32_t * __restrict__ baby, uint32_t nbaby,
+              uint32_t * __restrict__ state,
+              const uint32_t * __restrict__ Ng, uint32_t np0,
+              uint32_t i0, uint32_t i1)
 {
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
   const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t T = gridDim.x * blockDim.x;
   const uint32_t off = g.lane * L;
@@ -309,6 +337,31 @@ s2_norm_kernel (uint32_t * __restrict__ baby, uint32_t nbaby,
   s2_store<L> (state, acc, S_AUX_X, T, t);
 }
 
+template<int L, bool SOLO>
+__global__ void __launch_bounds__ (GPU_TPB, 1)
+s2_norm_kernel (uint32_t * __restrict__ baby, uint32_t nbaby,
+                uint32_t * __restrict__ state,
+                const uint32_t * __restrict__ Ng, uint32_t np0,
+                uint32_t tpi, uint32_t i0, uint32_t i1)
+{
+  gm_group g;
+  g.init (SOLO ? 1 : tpi);
+  s2_norm_body<L, SOLO> (g, baby, nbaby, state, Ng, np0, i0, i1);
+}
+
+template<int L>
+__global__ void __launch_bounds__ (GPU_TPB, 1)
+s2_norm_wide_kernel (uint32_t * __restrict__ baby, uint32_t nbaby,
+                     uint32_t * __restrict__ state,
+                     const uint32_t * __restrict__ Ng, uint32_t np0,
+                     uint32_t tpi, uint32_t i0, uint32_t i1)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  s2_norm_body<L, false> (g, baby, nbaby, state, Ng, np0, i0, i1);
+}
+
 /* Process COUNT giant steps: for each, multiply in the terms of the baby
  * steps set in its mask (MW words), then advance.  Only the current giant
  * step G_k and X(G_k) BZ live in registers; the accumulator, BZ, DQ and
@@ -324,16 +377,13 @@ struct s2_main_occupancy {
   enum { blocks = (!SOLO && L == 7) ? 3 : (!SOLO && L == 8) ? 4 : 1 };
 };
 
-template<int L, bool SOLO>
-__global__ void
-__launch_bounds__ (GPU_TPB, s2_main_occupancy<L, SOLO>::blocks)
-s2_main_kernel (const uint32_t * __restrict__ masks, uint32_t count,
-                uint32_t mw, const uint32_t * __restrict__ baby,
-                uint32_t * __restrict__ state,
-                const uint32_t * __restrict__ Ng, uint32_t np0, uint32_t tpi)
+template<int L, bool SOLO, class G>
+__device__ __forceinline__ void
+s2_main_body (const G &g, const uint32_t * __restrict__ masks, uint32_t count,
+              uint32_t mw, const uint32_t * __restrict__ baby,
+              uint32_t * __restrict__ state,
+              const uint32_t * __restrict__ Ng, uint32_t np0)
 {
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
   const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t T = gridDim.x * blockDim.x;
   const uint32_t off = g.lane * L;
@@ -400,6 +450,33 @@ s2_main_kernel (const uint32_t * __restrict__ masks, uint32_t count,
 
   s2_store<L> (state, cX, S_CUR_X, T, t);
   s2_store<L> (state, cZ, S_CUR_Z, T, t);
+}
+
+template<int L, bool SOLO>
+__global__ void
+__launch_bounds__ (GPU_TPB, s2_main_occupancy<L, SOLO>::blocks)
+s2_main_kernel (const uint32_t * __restrict__ masks, uint32_t count,
+                uint32_t mw, const uint32_t * __restrict__ baby,
+                uint32_t * __restrict__ state,
+                const uint32_t * __restrict__ Ng, uint32_t np0, uint32_t tpi)
+{
+  gm_group g;
+  g.init (SOLO ? 1 : tpi);
+  s2_main_body<L, SOLO> (g, masks, count, mw, baby, state, Ng, np0);
+}
+
+template<int L>
+__global__ void __launch_bounds__ (GPU_TPB, 1)
+s2_main_wide_kernel (const uint32_t * __restrict__ masks, uint32_t count,
+                     uint32_t mw, const uint32_t * __restrict__ baby,
+                     uint32_t * __restrict__ state,
+                     const uint32_t * __restrict__ Ng, uint32_t np0,
+                     uint32_t tpi)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  s2_main_body<L, false> (g, masks, count, mw, baby, state, Ng, np0);
 }
 
 #endif /* _GPU_STAGE2_KERNEL_CUH */

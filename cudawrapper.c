@@ -289,6 +289,13 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
      multiple of B1 rather than the CPU's (much larger) default. */
   gpu_stage2 = (params->gpu == 1);
   mpz_init_set (B2_parm, params->B2);
+  if (gpu_stage2 && !ECM_IS_DEFAULT_B2 (B2_parm)
+      && mpz_sizeinbase (B2_parm, 2) > 62)
+    {
+      outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (B2 above 2^62 is too "
+               "large for GPU stage 2)\n");
+      gpu_stage2 = 0;
+    }
   if (gpu_stage2 && ECM_IS_DEFAULT_B2 (B2_parm))
     mpz_set_d (B2_parm, GPU_STAGE2_DEFAULT_B2_FACTOR * B1);
 
@@ -335,9 +342,15 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
     }
 
   /* Pick the kernel for this size of n; if the number of curves wasn't
-     given, this also chooses it (enough to fill the GPU). */
+     given, this also chooses it (enough to fill the GPU).  A given count is
+     rounded up as select_and_init_GPU does (which only runs once). */
   if (!resume)
-    nb_curves = params->gpu_number_of_curves;
+    {
+      nb_curves = params->gpu_number_of_curves;
+      if (nb_curves % ECM_GPU_CURVES_BY_BLOCK != 0)
+        nb_curves = (nb_curves / ECM_GPU_CURVES_BY_BLOCK + 1)
+                    * ECM_GPU_CURVES_BY_BLOCK;
+    }
   gpu_config = gpu_ecm_stage1_plan (n, &nb_curves, params->verbose);
   if (gpu_config < 0)
     {
@@ -345,6 +358,15 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       goto end_gpu_ecm;
     }
   mutable_params->gpu_number_of_curves = nb_curves;
+
+  /* GPU stage 2 has kernels for every stage 1 configuration that the
+     planner picks; a forced one without them gets stage 2 on the CPU. */
+  if (gpu_stage2 && !gpu_ecm_stage2_supported (gpu_config))
+    {
+      outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (no GPU stage 2 "
+               "kernel for this configuration)\n");
+      gpu_stage2 = 0;
+    }
 
   ASSERT (params->sigma_is_A == 0);
   if (resume)

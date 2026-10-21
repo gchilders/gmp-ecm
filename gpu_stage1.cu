@@ -42,6 +42,14 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
  *   aZ' = K * (BB + dK)    10N^2 -> < 2N
  *   bX' = (DA + CB)^2      16N^2 -> < 2N
  *   bZ' = 2 (DA - CB)^2            < 4N
+ *
+ * That is the unswapped order.  When the bit changes the two points swap,
+ * and the doubled bZ < 4N comes in as aZ: then w < 6N, AA < 3.25N and
+ * aZ' < 2.3N, above the 2N of the table.  Iterating the worst cases (a
+ * product of x and y is below x y / R + N) over any pattern of swaps, the
+ * inputs settle below aX < 1.2N, aZ < 1.6N, bX < 1.6N, bZ < 2.5N: every
+ * subtrahend stays below 2N, as gm_sub needs, and every sum below 4.5N,
+ * far from R.  Nothing else is needed for the results mod N to be right.
  */
 
 #ifndef __CUDACC__
@@ -57,11 +65,13 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <vector>
 
 #include <gmp.h>
+#include <algorithm>
 #include <cuda.h>
 
 #include "cudacommon.h"
 #include "gpu_common.cuh"
 #include "gpu_kernels.h"
+#include "gpu_ntt.h"
 
 #include "ecm.h"
 #include "ecm-gpu.h"
@@ -69,12 +79,17 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 struct gpu_plan_t {
   uint32_t n_min;        /* key: minimal limb count */
   uint32_t req_curves;   /* key: requested curves (0 = fill GPU) */
-  uint32_t tpi, L;
+  uint32_t tpi, L;       /* schoolbook shape (tpi = 0 for the NTT path) */
   uint32_t curves;
   gpu_s1_fn fn;
+  gpu_ntt_plan *ntt;     /* NTT path: tables for this N, else NULL */
+  mpz_t ntt_N;           /* key of an NTT plan: the number itself */
 };
 
 static std::vector<gpu_plan_t> plans;
+
+/* (n_min, requested curves) for which the NTT beat the wide kernels */
+static std::vector<std::pair<uint32_t, uint32_t> > ntt_wins;
 
 static uint32_t
 round_up (uint32_t a, uint32_t m)
@@ -88,6 +103,12 @@ launch (const gpu_plan_t &p, uint32_t padded, const uint32_t *gpu_s_bits,
         const uint32_t *gpu_N, uint32_t np0, uint32_t sigma,
         const uint32_t *gpu_dlist = NULL, const uint32_t *gpu_x0 = NULL)
 {
+  if (p.ntt != NULL)
+    {
+      gpu_ntt_launch (p.ntt, padded, gpu_s_bits, s_nbits, start, count,
+                      gpu_data, sigma, gpu_dlist, gpu_x0);
+      return;
+    }
   uint32_t blocks = padded * p.tpi / GPU_TPB;
   p.fn<<<blocks, GPU_TPB>>> (gpu_s_bits, s_nbits, start, count, gpu_data,
                              gpu_N, np0, sigma, p.tpi, gpu_dlist, gpu_x0);
@@ -97,7 +118,16 @@ launch (const gpu_plan_t &p, uint32_t padded, const uint32_t *gpu_s_bits,
 static uint32_t
 padded_curves (const gpu_plan_t &p, uint32_t curves)
 {
+  if (p.ntt != NULL)
+    return curves;   /* one thread block per curve */
   return round_up (curves, GPU_TPB / p.tpi);
+}
+
+/* limbs per number */
+static uint32_t
+plan_limbs (const gpu_plan_t &p)
+{
+  return p.ntt != NULL ? gpu_ntt_limbs (p.ntt) : p.tpi * p.L;
 }
 
 /* Curves needed to fill the GPU with kernel FN at TPI threads per curve. */
@@ -120,7 +150,7 @@ fill_curves (gpu_s1_fn fn, uint32_t tpi)
 static double
 time_plan (const gpu_plan_t &p, uint32_t n_min)
 {
-  const uint32_t n = p.tpi * p.L;
+  const uint32_t n = plan_limbs (p);
   const uint32_t padded = padded_curves (p, p.curves);
   const uint64_t s_nbits = 4096;
   uint32_t *gpu_s_bits, *gpu_data, *gpu_N;
@@ -182,10 +212,65 @@ gpu_ecm_plan_shape (int config, uint32_t *tpi, uint32_t *L)
 }
 
 extern "C"
+struct gpu_ntt_plan *
+gpu_ecm_plan_ntt (int config)
+{
+  assert (config >= 0 && (size_t) config < plans.size ());
+  return plans[config].ntt;
+}
+
+/* Largest input of the schoolbook kernels within a warp: n limbs take
+   inputs of up to 32 n - GPU_SPARE_BITS bits (see n_min). */
+static size_t
+warp_max_bits (void)
+{
+  return 32 * 32 * GPU_DIST_MAX_L - GPU_SPARE_BITS;
+}
+
+/* Largest input of the schoolbook kernels; above it only the NTT path. */
+static size_t
+school_max_bits (void)
+{
+  return 32 * GPU_WIDE_MAX_TPI * GPU_DIST_MAX_L - GPU_SPARE_BITS;
+}
+
+/* Free the NTT plans of numbers other than N: they hold tables and
+   per-curve scratch on the GPU, and the numbers come one after another.
+   (Configuration handles only live through one gpu_ecm call.) */
+static void
+drop_ntt_plans (const mpz_t N)
+{
+  for (size_t i = 0; i < plans.size (); )
+    if (plans[i].ntt != NULL && mpz_cmp (plans[i].ntt_N, N) != 0)
+      {
+        gpu_ntt_destroy (plans[i].ntt);
+        mpz_clear (plans[i].ntt_N);
+        plans.erase (plans.begin () + i);
+      }
+    else
+      i++;
+}
+
+static gpu_plan_t
+ntt_plan (const mpz_t N, int lg, uint32_t n_min, uint32_t req_curves)
+{
+  gpu_plan_t p;
+  p.n_min = n_min;
+  p.req_curves = req_curves;
+  p.tpi = 0;
+  p.L = 0;
+  p.fn = NULL;
+  p.ntt = gpu_ntt_create (N, lg);
+  mpz_init_set (p.ntt_N, N);
+  p.curves = req_curves ? req_curves : gpu_ntt_fill_curves (p.ntt);
+  return p;
+}
+
+extern "C"
 size_t
 gpu_ecm_stage1_max_bits (void)
 {
-  return 32 * 32 * GPU_DIST_MAX_L - GPU_SPARE_BITS - 1;
+  return std::max (school_max_bits (), gpu_ntt_max_bits ());
 }
 
 extern "C"
@@ -200,26 +285,61 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
       return ECM_ERROR;
     }
   uint32_t n_min = (uint32_t) ((bits + GPU_SPARE_BITS + 31) / 32);
+  drop_ntt_plans (N);
+
+  /* GMPECM_GPU_KERNEL=TPI:L or TPI forces a configuration, =ntt the NTT */
+  const char *env = getenv ("GMPECM_GPU_KERNEL");
+  const bool force_ntt = env != NULL && strcmp (env, "ntt") == 0;
+  uint32_t force_tpi = 0, force_L = 0;
+  if (env != NULL && *env != '\0' && !force_ntt)
+    {
+      if (sscanf (env, "%u:%u", &force_tpi, &force_L) < 1)
+        force_tpi = 0;
+    }
+  /* Up to warp_max_bits, the kernels within a warp (GPU stage 2 needs
+     them).  Above, the wide kernels and the NTT are timed against each
+     other, unless only the NTT can take the input. */
+  const bool beyond_warp = bits > warp_max_bits ();
+  bool use_ntt = force_ntt || bits > school_max_bits ()
+                 || std::find (ntt_wins.begin (), ntt_wins.end (),
+                               std::make_pair (n_min, *curves))
+                    != ntt_wins.end ();
 
   for (size_t i = 0; i < plans.size (); i++)
-    if (plans[i].n_min == n_min && plans[i].req_curves == *curves)
+    if (plans[i].req_curves == *curves
+        && (use_ntt ? plans[i].ntt != NULL && mpz_cmp (plans[i].ntt_N, N) == 0
+                    : plans[i].ntt == NULL && plans[i].n_min == n_min))
       {
         if (*curves == 0)
           *curves = plans[i].curves;
         return (int) i;
       }
 
-  /* GMPECM_GPU_KERNEL=TPI:L or TPI forces a configuration */
-  uint32_t force_tpi = 0, force_L = 0;
-  const char *env = getenv ("GMPECM_GPU_KERNEL");
-  if (env != NULL && *env != '\0')
+  const int lg = gpu_ntt_lg_for_bits (bits);
+  const bool ntt_fits = lg >= 0 && lg <= gpu_ntt_device_max_lg ();
+  if (use_ntt)
     {
-      if (sscanf (env, "%u:%u", &force_tpi, &force_L) < 1)
-        force_tpi = 0;
+      if (!ntt_fits)
+        {
+          outputf (OUTPUT_ERROR, "GPU: no NTT size for a %zu-bit input on "
+                   "this GPU%s\n", bits,
+                   lg >= 0 ? " (too little shared memory)" : "");
+          return ECM_ERROR;
+        }
+      gpu_plan_t p = ntt_plan (N, lg, n_min, *curves);
+      if (verbose >= OUTPUT_VERBOSE)
+        printf ("GPU: NTT multiplication, transform length 2^%d, %u-limb "
+                "numbers, %u curves\n", lg, gpu_ntt_limbs (p.ntt), p.curves);
+      plans.push_back (p);
+      if (*curves == 0)
+        *curves = p.curves;
+      return (int) plans.size () - 1;
     }
 
   std::vector<gpu_plan_t> cand;
-  for (uint32_t tpi = 1; tpi <= 32; tpi *= 2)
+  const uint32_t max_tpi = beyond_warp || force_tpi > 32 ? GPU_WIDE_MAX_TPI
+                                                        : 32;
+  for (uint32_t tpi = 1; tpi <= max_tpi; tpi *= 2)
     {
       if (force_tpi && tpi != force_tpi)
         continue;
@@ -242,9 +362,12 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
       p.tpi = tpi;
       p.L = L;
       p.fn = fn;
+      p.ntt = NULL;
       p.curves = *curves ? *curves : fill_curves (fn, tpi);
       cand.push_back (p);
     }
+  if (beyond_warp && !force_tpi && ntt_fits)
+    cand.push_back (ntt_plan (N, lg, n_min, *curves));
 
   if (cand.empty ())
     {
@@ -261,15 +384,35 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
         {
           double t = time_plan (cand[i], n_min);
           if (verbose >= OUTPUT_VERBOSE)
-            printf ("GPU: kernel TPI=%u L=%u (%u bits): %u curves, "
-                    "%.3g us per curve-bit\n", cand[i].tpi, cand[i].L,
-                    32 * cand[i].tpi * cand[i].L, cand[i].curves, t * 1e6);
+            {
+              if (cand[i].ntt != NULL)
+                printf ("GPU: NTT, transform length 2^%d: %u curves, "
+                        "%.3g us per curve-bit\n", lg, cand[i].curves, t * 1e6);
+              else
+                printf ("GPU: kernel TPI=%u L=%u (%u bits): %u curves, "
+                        "%.3g us per curve-bit\n", cand[i].tpi, cand[i].L,
+                        32 * cand[i].tpi * cand[i].L, cand[i].curves, t * 1e6);
+            }
           if (i == 0 || t < best_t)
             {
               best = i;
               best_t = t;
             }
         }
+    }
+  for (size_t i = 0; i < cand.size (); i++)
+    if (i != best && cand[i].ntt != NULL)
+      {
+        gpu_ntt_destroy (cand[i].ntt);
+        mpz_clear (cand[i].ntt_N);
+      }
+  if (cand[best].ntt != NULL)
+    {
+      ntt_wins.push_back (std::make_pair (n_min, *curves));
+      if (verbose >= OUTPUT_VERBOSE)
+        printf ("GPU: NTT multiplication, transform length 2^%d, %u-limb "
+                "numbers, %u curves\n", lg, gpu_ntt_limbs (cand[best].ntt),
+                cand[best].curves);
     }
 
   plans.push_back (cand[best]);
@@ -308,7 +451,7 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
       return ECM_ERROR;
     }
 
-  const uint32_t n = p.tpi * p.L;
+  const uint32_t n = plan_limbs (p);
   const uint32_t padded = padded_curves (p, curves);
   assert (mpz_sizeinbase (N, 2) + GPU_SPARE_BITS <= 32 * (size_t) n);
 
@@ -437,6 +580,9 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
   CUDA_CHECK (cudaEventCreate (&batch_start));
   CUDA_CHECK (cudaEventCreate (&stop));
   CUDA_CHECK (cudaEventRecord (global_start));
+  /* also STOP, for an exponent of one bit (a resumed curve whose B1done
+     and B1 have no prime power between them): no launch records it then */
+  CUDA_CHECK (cudaEventRecord (stop));
 
   uint32_t *gpu_s_bits, *gpu_data, *gpu_N;
   CUDA_CHECK (cudaMalloc ((void **) &gpu_s_bits, s_words * sizeof (uint32_t)));
@@ -464,11 +610,18 @@ gpu_ecm_stage1 (mpz_t *factors, int *array_found,
       CUDA_CHECK (cudaMemcpy (gpu_x0, x0limbs, bytes, cudaMemcpyHostToDevice));
     }
 
-  kernel_info ((const void *) p.fn, verbose);
-  outputf (OUTPUT_VERBOSE, "GPU: %u-bit arithmetic (TPI=%u, L=%u), "
-           "%u blocks x %u threads, input number is %zu bits\n",
-           32 * n, p.tpi, p.L, padded * p.tpi / GPU_TPB, GPU_TPB,
-           mpz_sizeinbase (N, 2));
+  if (p.ntt != NULL)
+    outputf (OUTPUT_VERBOSE, "GPU: %u-bit arithmetic (NTT), %u curves, "
+             "input number is %zu bits\n", 32 * n, padded,
+             mpz_sizeinbase (N, 2));
+  else
+    {
+      kernel_info ((const void *) p.fn, verbose);
+      outputf (OUTPUT_VERBOSE, "GPU: %u-bit arithmetic (TPI=%u, L=%u), "
+               "%u blocks x %u threads, input number is %zu bits\n",
+               32 * n, p.tpi, p.L, padded * p.tpi / GPU_TPB, GPU_TPB,
+               mpz_sizeinbase (N, 2));
+    }
 
   /* The first bit (doubling) is handled by the initial 2P. */
   uint64_t s_partial = 1;

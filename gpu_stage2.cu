@@ -40,10 +40,13 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
  * Every launch is sized to take about 100 ms, the one-off setup kernels
  * included: they work in slices, with their state in device memory.
  *
- * The numbers use the same (TPI, L) shape as stage 1 (gpu_ecm_stage1_plan).
- * Per-curve arrays in device memory are laid out so that a warp's loads are
+ * The numbers use the same representation as stage 1 (gpu_ecm_stage1_plan).
+ * With the schoolbook kernels (TPI threads per curve, L limbs each), the
+ * per-curve arrays in device memory are laid out so that a warp's loads are
  * contiguous: limb k of number s for thread t is at (s * L + k) * T + t,
- * T = total threads.
+ * T = total threads.  On the NTT path (one thread block per curve, W limbs
+ * per number, gpu_ntt.cu) each curve's numbers are contiguous instead:
+ * limb w of its number s is at (curve * S + s) * W + w, S numbers per curve.
  */
 
 #ifndef __CUDACC__
@@ -66,6 +69,7 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include "cudacommon.h"
 #include "gpu_common.cuh"
 #include "gpu_kernels.h"
+#include "gpu_ntt.h"
 #include "gpu_stage2_kernel.cuh"
 
 #include "ecm.h"
@@ -323,6 +327,20 @@ s2_replay (mpz_t f, const mpz_t x0, uint32_t sigma, const mpz_t N,
   return found;
 }
 
+/* A < 2^64 as a uint64_t (mpz_get_ui may be 32 bits, mpz_get_d rounds) */
+static uint64_t
+s2_get_u64 (const mpz_t a)
+{
+  mpz_t t;
+  mpz_init (t);
+  mpz_tdiv_q_2exp (t, a, 32);
+  uint64_t r = (uint64_t) mpz_get_ui (t) << 32;
+  mpz_tdiv_r_2exp (t, a, 32);
+  r |= mpz_get_ui (t);
+  mpz_clear (t);
+  return r;
+}
+
 /* Time the launches between start and stop: milliseconds. */
 static float
 s2_wait (cudaEvent_t start, cudaEvent_t stop)
@@ -342,6 +360,18 @@ s2_wait (cudaEvent_t start, cudaEvent_t stop)
 
 extern "C"
 int
+gpu_ecm_stage2_supported (int config)
+{
+  uint32_t tpi, L;
+  gpu_ecm_plan_shape (config, &tpi, &L);
+  if (tpi == 0)
+    return 1;
+  const gpu_kernel_set *ks = gpu_kernels (tpi, L);
+  return ks != NULL && ks->s2_main != NULL;
+}
+
+extern "C"
+int
 gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
                 const mpz_t B2min, const mpz_t B2,
                 uint32_t curves, uint32_t sigma, const uint32_t *sigmas,
@@ -349,13 +379,15 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
 {
   uint32_t tpi, L;
   gpu_ecm_plan_shape (config, &tpi, &L);
-  const uint32_t n = tpi * L;
-  const uint32_t padded = (curves + GPU_TPB / tpi - 1) / (GPU_TPB / tpi)
-                          * (GPU_TPB / tpi);
+  gpu_ntt_plan *ntt = tpi == 0 ? gpu_ecm_plan_ntt (config) : NULL;
+  const uint32_t n = ntt != NULL ? gpu_ntt_limbs (ntt) : tpi * L;
+  const uint32_t padded = ntt != NULL ? curves
+                          : (curves + GPU_TPB / tpi - 1) / (GPU_TPB / tpi)
+                            * (GPU_TPB / tpi);
   const uint32_t T = padded * tpi;
   const uint32_t blocks = T / GPU_TPB;
-  const gpu_kernel_set *ks = gpu_kernels (tpi, L);
-  assert (ks != NULL);
+  const gpu_kernel_set *ks = ntt != NULL ? NULL : gpu_kernels (tpi, L);
+  assert (ntt != NULL || (ks != NULL && ks->s2_main != NULL));
 
   *gputime = 0;
   if (mpz_sizeinbase (B2, 2) > 62)
@@ -363,8 +395,8 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
       outputf (OUTPUT_ERROR, "GPU: Error, B2 too large for GPU stage 2\n");
       return ECM_ERROR;
     }
-  uint64_t lo = mpz_sgn (B2min) > 0 ? (uint64_t) mpz_get_d (B2min) : 0;
-  uint64_t hi = (uint64_t) mpz_get_d (B2);
+  uint64_t lo = mpz_sgn (B2min) > 0 ? s2_get_u64 (B2min) : 0;
+  uint64_t hi = s2_get_u64 (B2);
   if (hi <= lo)
     return ECM_NO_FACTOR_FOUND;
 
@@ -383,7 +415,7 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
         if (gcd_ul (j, d) == 1)
           jl.push_back (j);
       /* X and Z per baby step */
-      size_t bytes = (size_t) T * L * 2 * jl.size () * sizeof (uint32_t);
+      size_t bytes = (size_t) padded * n * 2 * jl.size () * sizeof (uint32_t);
       if ((lo + d / 2) / d >= 2 && bytes < free_mem / 2)
         {
           D = d;
@@ -416,7 +448,7 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
   outputf (OUTPUT_VERBOSE, "GPU stage 2: D=%u, %u baby steps, giant steps "
            "%lu..%lu, %'lu bytes of baby steps\n", D, nbaby,
            (unsigned long) k0, (unsigned long) kend - 1,
-           (size_t) T * L * 2 * nbaby * sizeof (uint32_t));
+           (size_t) padded * n * 2 * nbaby * sizeof (uint32_t));
 
   /* host data: x residues and constants in Montgomery form */
   uint32_t *xin = (uint32_t *) calloc ((size_t) padded * n, sizeof (uint32_t));
@@ -446,8 +478,8 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
   CUDA_CHECK (cudaMalloc ((void **) &g_N, n * 4));
   CUDA_CHECK (cudaMalloc ((void **) &g_one, n * 4));
   CUDA_CHECK (cudaMalloc ((void **) &g_jl, nbaby * 4));
-  CUDA_CHECK (cudaMalloc ((void **) &g_baby, (size_t) T * L * 2 * nbaby * 4));
-  CUDA_CHECK (cudaMalloc ((void **) &g_state, (size_t) T * L * S_COUNT * 4));
+  CUDA_CHECK (cudaMalloc ((void **) &g_baby, (size_t) padded * n * 2 * nbaby * 4));
+  CUDA_CHECK (cudaMalloc ((void **) &g_state, (size_t) padded * n * S_COUNT * 4));
   CUDA_CHECK (cudaMalloc ((void **) &g_mask, (size_t) S2_MAX_STEPS * mw * 4));
   CUDA_CHECK (cudaMemcpy (g_xin, xin, (size_t) padded * n * 4,
                           cudaMemcpyHostToDevice));
@@ -489,9 +521,13 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
       while (next0 < nbaby && jlist[next0] <= jmax)
         next0++;
       CUDA_CHECK (cudaEventRecord (bstart));
-      ks->s2_setup<<<blocks, GPU_TPB>>> (g_xin, g_N, g_one, np0, sigma, tpi,
-                                         D / 2, g_jl, nbaby, g_baby, g_state,
-                                         s, s + cnt, next0, g_dl);
+      if (ntt != NULL)
+        gpu_ntt_s2_setup (ntt, padded, g_xin, g_one, D / 2, g_jl, nbaby,
+                          g_baby, g_state, s, s + cnt, next0, sigma, g_dl);
+      else
+        ks->s2_setup<<<blocks, GPU_TPB>>> (g_xin, g_N, g_one, np0, sigma, tpi,
+                                           D / 2, g_jl, nbaby, g_baby,
+                                           g_state, s, s + cnt, next0, g_dl);
       CUDA_CHECK (cudaGetLastError ());
       batch_ms = s2_wait (bstart, stop);
       max_ms = std::max (max_ms, batch_ms);
@@ -506,8 +542,11 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
       uint64_t want = std::max ((uint64_t) 1, budget / S2_COST_NORM);
       uint32_t cnt = (uint32_t) std::min ((uint64_t) 2 * nbaby - i, want);
       CUDA_CHECK (cudaEventRecord (bstart));
-      ks->s2_norm<<<blocks, GPU_TPB>>> (g_baby, nbaby, g_state, g_N, np0,
-                                        tpi, i, i + cnt);
+      if (ntt != NULL)
+        gpu_ntt_s2_norm (ntt, padded, g_baby, nbaby, g_state, i, i + cnt);
+      else
+        ks->s2_norm<<<blocks, GPU_TPB>>> (g_baby, nbaby, g_state, g_N, np0,
+                                          tpi, i, i + cnt);
       CUDA_CHECK (cudaGetLastError ());
       batch_ms = s2_wait (bstart, stop);
       max_ms = std::max (max_ms, batch_ms);
@@ -541,9 +580,13 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
           while (pos + cnt < chunk && units + cost[pos + cnt] <= budget)
             units += cost[pos + cnt++];
           CUDA_CHECK (cudaEventRecord (bstart));
-          ks->s2_main<<<blocks, GPU_TPB>>> (g_mask + (size_t) pos * mw, cnt,
-                                            mw, g_baby, g_state, g_N, np0,
-                                            tpi);
+          if (ntt != NULL)
+            gpu_ntt_s2_main (ntt, padded, g_mask + (size_t) pos * mw, cnt, mw,
+                             g_baby, nbaby, g_state);
+          else
+            ks->s2_main<<<blocks, GPU_TPB>>> (g_mask + (size_t) pos * mw, cnt,
+                                              mw, g_baby, g_state, g_N, np0,
+                                              tpi);
           CUDA_CHECK (cudaGetLastError ());
           batch_ms = s2_wait (bstart, stop);
           max_ms = std::max (max_ms, batch_ms);
@@ -560,14 +603,17 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
   prime_info_clear (sv.pi);
 
   /* gather the accumulators */
-  uint32_t *acc = (uint32_t *) malloc ((size_t) T * L * 4);
-  CUDA_CHECK (cudaMemcpy (acc, g_state + (size_t) S_ACC * L * T,
-                          (size_t) T * L * 4, cudaMemcpyDeviceToHost));
+  const size_t accw = ntt != NULL ? (size_t) padded * n * S_COUNT
+                                  : (size_t) T * L;
+  uint32_t *acc = (uint32_t *) malloc (accw * 4);
+  CUDA_CHECK (cudaMemcpy (acc, ntt != NULL ? g_state
+                                           : g_state + (size_t) S_ACC * L * T,
+                          accw * 4, cudaMemcpyDeviceToHost));
   cudaEventElapsedTime (gputime, start, stop);
 
   outputf (OUTPUT_VERBOSE, "GPU stage 2: %'lu (giant, baby) pairs, %lu giant "
            "steps, longest launch %.0f ms\n", (unsigned long) sv.pairs,
-           (unsigned long) (kend - k0), max_ms);
+           (unsigned long) (kend > k0 ? kend - k0 : 0), max_ms);
 
   int youpi = ECM_NO_FACTOR_FOUND;
   {
@@ -577,9 +623,12 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
     mpz_init (f);
     for (uint32_t i = 0; i < curves; i++)
       {
-        for (uint32_t ln = 0; ln < tpi; ln++)
-          for (uint32_t w = 0; w < L; w++)
-            a[ln * L + w] = acc[(size_t) w * T + i * tpi + ln];
+        if (ntt != NULL)
+          memcpy (a, acc + ((size_t) i * S_COUNT + S_ACC) * n, n * 4);
+        else
+          for (uint32_t ln = 0; ln < tpi; ln++)
+            for (uint32_t w = 0; w < L; w++)
+              a[ln * L + w] = acc[(size_t) w * T + i * tpi + ln];
         gpu_from_limbs (v, a, n);
         mpz_gcd (f, v, N);
         if (mpz_cmp (f, N) == 0)

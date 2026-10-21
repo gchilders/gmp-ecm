@@ -28,8 +28,15 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #define GPU_TPB 128
 #define GPU_SOLO_MAX_L 16
 #define GPU_DIST_MAX_L 24
+#define GPU_WIDE_MAX_TPI 128   /* wide groups: 64 or 128 threads per curve */
 /* N must be below 2^(32n - GPU_SPARE_BITS) */
 #define GPU_SPARE_BITS 4
+
+/* Stage 2 state slots per curve (gpu_stage2.cu).  AUX holds 2Q during
+   setup and the running product of the Z's while the baby steps are put on
+   a shared denominator; BZ holds that denominator. */
+enum { S_PREV_X, S_PREV_Z, S_CUR_X, S_CUR_Z, S_DQ_X, S_DQ_Z, S_ACC, S_BZ,
+       S_AUX_X, S_AUX_Z, S_COUNT };
 
 /* Kernel table indexed by L (index 0 unused), filled by template recursion:
    KT<L, SOLO>::fill (t) stores F<L, SOLO> for every L down to 1. */

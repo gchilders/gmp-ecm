@@ -19,10 +19,13 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 */
 
 /* An n-limb number (32-bit limbs) is spread over a group of TPI consecutive
- * lanes of a warp, L limbs per lane, n = TPI * L.  Lane t holds limbs
+ * threads, L limbs per thread, n = TPI * L.  Thread t holds limbs
  * [t*L, t*L + L).  L is a compile-time constant; TPI is chosen at run time
- * (any power of two up to 32), except that TPI == 1 ("solo", one curve per
- * thread) is a separate compile-time specialisation with no shuffles.
+ * (any power of two up to 32: lanes of one warp, gm_group), except that
+ * TPI == 1 ("solo", one curve per thread) is a separate compile-time
+ * specialisation with no shuffles.  Wide groups of TPI = 64 or 128 threads
+ * (gm_wgroup) span warps of one block and exchange what crosses a warp
+ * through shared memory; the functions below take either kind of group.
  *
  * All arithmetic is lazy: with R = 2^(32n) and 16N <= R, Montgomery products
  * of inputs whose product is below 16N^2 come out below 2N, so no
@@ -68,6 +71,7 @@ GM_DEV uint32_t madchi (uint32_t a, uint32_t b, uint32_t c)
 /* ---- lane group ------------------------------------------------------ */
 
 struct gm_group {
+  static constexpr bool wide = false;
   uint32_t tpi;   /* threads per instance (power of 2, <= 32) */
   uint32_t lane;  /* index of this thread inside its group */
   uint32_t base;  /* lane id (in the warp) of the group's lane 0 */
@@ -84,27 +88,180 @@ struct gm_group {
 
   /* This group's bits of a warp ballot. */
   GM_DEV uint32_t bits (uint32_t ballot) const { return (ballot >> base) & mask; }
+
+  /* Given per-lane carry-out bits GEN (to lane+1) and per-lane PROP bits
+   * (the lane would pass an incoming carry straight through), return the
+   * carry into this lane and, in *top, the carry out of the whole group.
+   * The same identity serves borrows (prop = "slice is all zeros"). */
+  GM_DEV uint32_t resolve (uint32_t gen, uint32_t prop, uint32_t *top) const
+  {
+    uint32_t G = bits (__ballot_sync (GM_FULL, gen));
+    uint32_t P = bits (__ballot_sync (GM_FULL, prop));
+    uint64_t x = ((uint64_t) G << 1) + P;
+    uint32_t C = (uint32_t) x ^ P;
+    if (top)
+      *top = (uint32_t) (x >> tpi) & 1;
+    return (C >> lane) & 1;
+  }
+
+  /* V of the lane below (0 in lane 0) */
+  GM_DEV uint32_t from_below (uint32_t v) const
+  {
+    uint32_t r = __shfl_up_sync (GM_FULL, v, 1, tpi);
+    return lane == 0 ? 0 : r;
+  }
+
+  /* V of the lane above (the top lane gets lane 0's; callers pass zero
+     there) */
+  GM_DEV uint32_t from_above (uint32_t v) const
+  {
+    return __shfl_sync (GM_FULL, v, (lane + 1) & (tpi - 1), tpi);
+  }
+
+  /* V of lane SRC */
+  GM_DEV uint32_t bcast (uint32_t v, uint32_t src) const
+  {
+    return __shfl_sync (GM_FULL, v, src, tpi);
+  }
 };
 
-/* Given per-lane carry-out bits GEN (to lane+1) and per-lane PROP bits
- * (the lane would pass an incoming carry straight through), return the
- * carry into this lane and, in *top, the carry out of the whole group.
- * The same identity serves borrows (prop = "slice is all zeros"). */
-GM_DEV uint32_t gm_resolve (const gm_group &g, uint32_t gen, uint32_t prop, uint32_t *top)
+/* A wide group: TPI = 64 or 128 threads (whole warps) of one block, one
+ * named barrier per group.  Shared memory per group (see gm_wshared_words):
+ * room for one operand, then two phases of GM_WSLOTS slot words.  Each
+ * synchronising operation writes the slots of the current phase, waits at
+ * the barrier, reads, and flips the phase; so a slot is only rewritten
+ * after a barrier that all of its readers have passed. */
+#define GM_WIDE_MAXK 4  /* product steps per barrier, at most */
+#define GM_WS_Q   0                       /* the q of 2K rows (warp 0) */
+#define GM_WS_IN  (2 * GM_WIDE_MAXK)      /* 2K per warp: words crossing to
+                                             the warp below */
+#define GM_WS_RES (GM_WS_IN + 3 * 2 * GM_WIDE_MAXK)  /* 2 per warp: ballots */
+#define GM_WS_ONE (GM_WS_RES + 8)         /* 1 per warp */
+#define GM_WSLOTS (GM_WS_ONE + 4)
+
+struct gm_wgroup {
+  static constexpr bool wide = true;
+  uint32_t tpi;    /* 64 or 128 */
+  uint32_t lane;   /* 0 .. tpi-1 */
+  uint32_t wl;     /* lane in the warp */
+  uint32_t warp;   /* warp in the group */
+  uint32_t nw;     /* warps in the group */
+  uint32_t bar;    /* named barrier */
+  uint32_t *sa;    /* operand area, tpi * L words */
+  uint32_t *ss;    /* slots */
+  mutable uint32_t phase;
+
+  GM_DEV void init (uint32_t t, uint32_t *smem, uint32_t L)
+  {
+    const uint32_t gi = threadIdx.x / t;
+    tpi = t;
+    lane = threadIdx.x & (t - 1);
+    wl = threadIdx.x & 31;
+    warp = lane >> 5;
+    nw = t >> 5;
+    bar = 1 + gi;
+    sa = smem + gi * t * L;
+    ss = smem + blockDim.x * L + gi * 2 * GM_WSLOTS;
+    phase = 0;
+  }
+
+  GM_DEV void sync () const
+  {
+    asm volatile ("bar.sync %0, %1;" :: "r"(bar), "r"(tpi) : "memory");
+  }
+
+  GM_DEV uint32_t *slots () const { return ss + phase * GM_WSLOTS; }
+
+  /* barrier, then flip the phase */
+  GM_DEV void exchange () const
+  {
+    sync ();
+    phase ^= 1;
+  }
+
+  GM_DEV uint32_t resolve (uint32_t gen, uint32_t prop, uint32_t *top) const
+  {
+    uint32_t G = __ballot_sync (GM_FULL, gen);
+    uint32_t P = __ballot_sync (GM_FULL, prop);
+    uint32_t *s = slots ();
+    if (wl == 0)
+      {
+        s[GM_WS_RES + 2 * warp] = G;
+        s[GM_WS_RES + 2 * warp + 1] = P;
+      }
+    exchange ();
+    /* C = ((G << 1) + P) ^ P over the nw-word numbers */
+    uint32_t cy = 0, prev = 0, cin = 0;
+    for (uint32_t w = 0; w < nw; w++)
+      {
+        const uint32_t gw = s[GM_WS_RES + 2 * w], pw = s[GM_WS_RES + 2 * w + 1];
+        const uint64_t x = (uint64_t) ((gw << 1) | (prev >> 31)) + pw + cy;
+        if (w == warp)
+          cin = (((uint32_t) x ^ pw) >> wl) & 1;
+        cy = (uint32_t) (x >> 32);
+        prev = gw;
+      }
+    if (top)
+      *top = ((prev >> 31) + cy) & 1;
+    return cin;
+  }
+
+  GM_DEV uint32_t from_below (uint32_t v) const
+  {
+    uint32_t r = __shfl_up_sync (GM_FULL, v, 1);
+    uint32_t *s = slots ();
+    if (wl == 31)
+      s[GM_WS_ONE + warp] = v;
+    exchange ();
+    if (wl == 0)
+      r = warp > 0 ? s[GM_WS_ONE + warp - 1] : 0;
+    return r;
+  }
+
+  /* (0 in the top thread) */
+  GM_DEV uint32_t from_above (uint32_t v) const
+  {
+    uint32_t r = __shfl_down_sync (GM_FULL, v, 1);
+    uint32_t *s = slots ();
+    if (wl == 0)
+      s[GM_WS_ONE + warp] = v;
+    exchange ();
+    if (wl == 31)
+      r = warp + 1 < nw ? s[GM_WS_ONE + warp + 1] : 0;
+    return r;
+  }
+
+  GM_DEV uint32_t bcast (uint32_t v, uint32_t src) const
+  {
+    uint32_t *s = slots ();
+    if (lane == src)
+      s[GM_WS_ONE] = v;
+    exchange ();
+    return s[GM_WS_ONE];
+  }
+};
+
+/* Which form of the wide product is faster for L (see gm_mul_dist): on an
+   A10 the lead form with 4 steps per barrier (which needs L >= 16) by
+   4-19%; below, the block form with 2 */
+GM_DEV constexpr bool gm_wide_lead_better (int L)
 {
-  uint32_t G = g.bits (__ballot_sync (GM_FULL, gen));
-  uint32_t P = g.bits (__ballot_sync (GM_FULL, prop));
-  uint64_t x = ((uint64_t) G << 1) + P;
-  uint32_t C = (uint32_t) x ^ P;
-  if (top)
-    *top = (uint32_t) (x >> g.tpi) & 1;
-  return (C >> g.lane) & 1;
+  return L >= 16;
+}
+
+/* Shared memory of the wide groups of a block of B threads. */
+#define GM_WSHARED_WORDS(B, L) ((B) * (L) + 2 * ((B) / 64) * GM_WSLOTS)
+
+template<class G>
+GM_DEV uint32_t gm_resolve (const G &g, uint32_t gen, uint32_t prop, uint32_t *top)
+{
+  return g.resolve (gen, prop, top);
 }
 
 /* r (a slice with carry-out bit GEN into the next lane) := fully
  * propagated sum.  The carry out of the top lane is dropped. */
-template<int L, bool SOLO>
-GM_DEV void gm_prop_carry (const gm_group &g, uint32_t (&r)[L], uint32_t gen)
+template<int L, bool SOLO, class G>
+GM_DEV void gm_prop_carry (const G &g, uint32_t (&r)[L], uint32_t gen)
 {
   if (SOLO)
     return;
@@ -126,8 +283,8 @@ GM_DEV void gm_prop_carry (const gm_group &g, uint32_t (&r)[L], uint32_t gen)
 }
 
 /* r = a + b.  Caller guarantees no overflow out of n limbs. */
-template<int L, bool SOLO>
-GM_DEV void gm_add (const gm_group &g, uint32_t (&r)[L],
+template<int L, bool SOLO, class G>
+GM_DEV void gm_add (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&b)[L])
 {
   r[0] = add_cc (a[0], b[0]);
@@ -140,8 +297,8 @@ GM_DEV void gm_add (const gm_group &g, uint32_t (&r)[L],
 
 /* r = a - b, plus m2 (= 2N) if a - b is negative.
  * Caller guarantees -m2 <= a - b < 2^(32n). */
-template<int L, bool SOLO>
-GM_DEV void gm_sub (const gm_group &g, uint32_t (&r)[L],
+template<int L, bool SOLO, class G>
+GM_DEV void gm_sub (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&b)[L],
                     const uint32_t (&m2)[L])
 {
@@ -180,16 +337,12 @@ GM_DEV void gm_sub (const gm_group &g, uint32_t (&r)[L],
 }
 
 /* r = 2a (no overflow out of n limbs). */
-template<int L, bool SOLO>
-GM_DEV void gm_dbl (const gm_group &g, uint32_t (&r)[L], const uint32_t (&a)[L])
+template<int L, bool SOLO, class G>
+GM_DEV void gm_dbl (const G &g, uint32_t (&r)[L], const uint32_t (&a)[L])
 {
   uint32_t in = 0;
   if (!SOLO)
-    {
-      in = __shfl_up_sync (GM_FULL, a[L-1] >> 31, 1, g.tpi);
-      if (g.lane == 0)
-        in = 0;
-    }
+    in = g.from_below (a[L-1] >> 31);
 #pragma unroll
   for (int k = L - 1; k > 0; k--)
     r[k] = __funnelshift_l (a[k-1], a[k], 1);
@@ -199,14 +352,12 @@ GM_DEV void gm_dbl (const gm_group &g, uint32_t (&r)[L], const uint32_t (&a)[L])
 /* After the accumulation loop of a Montgomery product each lane holds a
  * slice ACC plus a small word C (<= 2) belonging just above the slice.
  * Fold the C's upwards and propagate. */
-template<int L, bool SOLO>
-GM_DEV void gm_fold (const gm_group &g, uint32_t (&acc)[L], uint32_t c)
+template<int L, bool SOLO, class G>
+GM_DEV void gm_fold (const G &g, uint32_t (&acc)[L], uint32_t c)
 {
   if (SOLO)
     return;  /* C carries weight R, so it is 0 by the bounds. */
-  uint32_t cin = __shfl_up_sync (GM_FULL, c, 1, g.tpi);
-  if (g.lane == 0)
-    cin = 0;
+  uint32_t cin = g.from_below (c);
   uint32_t gen;
   if (L == 1)
     {
@@ -282,8 +433,8 @@ GM_DEV void gm_muladd (uint32_t (&acc)[L], uint32_t &h0, uint32_t &h1,
 /* One Montgomery row: ACC += ai * B + q * M, then shift the accumulator
  * (as a distributed number) down one limb, which turns rotation J into
  * J + 1.  Between rows h1 is 0 and h0 is a small carry (see gm_fold). */
-template<int L, bool SOLO, int J>
-GM_DEV void gm_row (const gm_group &g, uint32_t (&acc)[L], uint32_t &h0,
+template<int L, bool SOLO, int J, class G>
+GM_DEV void gm_row (const G &g, uint32_t (&acc)[L], uint32_t &h0,
                     uint32_t ai, const uint32_t (&b)[L],
                     const uint32_t (&m)[L], uint32_t mp0)
 {
@@ -292,7 +443,7 @@ GM_DEV void gm_row (const gm_group &g, uint32_t (&acc)[L], uint32_t &h0,
 
   uint32_t q = acc[J % L] * mp0;
   if (!SOLO)
-    q = __shfl_sync (GM_FULL, q, 0, g.tpi);
+    q = g.bcast (q, 0);
   gm_muladd<L, J> (acc, h0, h1, q, m);
 
   /* The old position 0 (zero in lane 0) moves to the lane below; the
@@ -300,7 +451,7 @@ GM_DEV void gm_row (const gm_group &g, uint32_t (&acc)[L], uint32_t &h0,
    * the limb from the lane above. */
   uint32_t in = 0;
   if (!SOLO)
-    in = __shfl_sync (GM_FULL, acc[J % L], (g.lane + 1) & (g.tpi - 1), g.tpi);
+    in = g.from_above (acc[J % L]);
   acc[J % L] = add_cc (h0, in);
   h0 = addc (h1, 0);
 }
@@ -308,19 +459,21 @@ GM_DEV void gm_row (const gm_group &g, uint32_t (&acc)[L], uint32_t &h0,
 /* L rows, with ai taken from limb j of lane S's copy of A. */
 template<int L, bool SOLO, int J>
 struct gm_rows {
-  GM_DEV static void run (const gm_group &g, uint32_t (&acc)[L], uint32_t &c,
+  template<class G>
+  GM_DEV static void run (const G &g, uint32_t (&acc)[L], uint32_t &c,
                           uint32_t s, const uint32_t (&a)[L],
                           const uint32_t (&b)[L], const uint32_t (&m)[L],
                           uint32_t mp0)
   {
-    uint32_t ai = SOLO ? a[J] : __shfl_sync (GM_FULL, a[J], s, g.tpi);
+    uint32_t ai = SOLO ? a[J] : g.bcast (a[J], s);
     gm_row<L, SOLO, J> (g, acc, c, ai, b, m, mp0);
     gm_rows<L, SOLO, J + 1>::run (g, acc, c, s, a, b, m, mp0);
   }
 };
 template<int L, bool SOLO>
 struct gm_rows<L, SOLO, L> {
-  GM_DEV static void run (const gm_group &, uint32_t (&)[L], uint32_t &,
+  template<class G>
+  GM_DEV static void run (const G &, uint32_t (&)[L], uint32_t &,
                           uint32_t, const uint32_t (&)[L],
                           const uint32_t (&)[L], const uint32_t (&)[L],
                           uint32_t) {}
@@ -352,12 +505,19 @@ GM_DEV void gm_ripple (uint32_t (&x)[N], int from, int to)
  * position 0 and (t1 X + q1 M) W at position 1, then shifts down two limbs;
  * the shift is folded into the last two chains (they write their sums two
  * limbs lower).  Between steps only A[0..L], U[0..L-1] and C are live,
- * and positions >= L hold a small carry. */
-template<int L>
-GM_DEV void gm_step2 (const gm_group &g, uint32_t (&A)[L + 3],
+ * and positions >= L hold a small carry.
+ *
+ * WIDE (gm_wgroup): with LEAD, warp 0 computes q0, q1 as usual and
+ * returns them in q0w, q1w, and the other warps take them from there;
+ * without, every warp takes them from q0w, q1w.  The two words for the
+ * lane below go out in w0o, w1o; within a warp they are also delivered
+ * here, but not across warps. */
+template<int L, bool WIDE, class G, bool LEAD = false>
+GM_DEV void gm_step2 (const G &g, uint32_t (&A)[L + 3],
                       uint32_t (&U)[L + 2], uint32_t &C,
                       uint32_t t0, uint32_t t1, const uint32_t (&x)[L],
-                      const uint32_t (&m)[L], uint32_t mp0)
+                      const uint32_t (&m)[L], uint32_t mp0,
+                      uint32_t &q0w, uint32_t &q1w, uint32_t &w0o, uint32_t &w1o)
 {
   /* row 0: C into position 0, its carry into U[0]; t0 * x_odd -> U */
   A[0] = add_cc (A[0], C);
@@ -373,7 +533,19 @@ GM_DEV void gm_step2 (const gm_group &g, uint32_t (&A)[L + 3],
     GM_P (A[k], A[k+1], t0, x[k]);
   gm_ripple<L + 3> (A, (L - 1) - ((L - 1) & 1) + 2, L + 2);
 
-  uint32_t q0 = __shfl_sync (GM_FULL, A[0] * mp0, 0, g.tpi);
+  uint32_t q0;
+  if constexpr (WIDE && LEAD)
+    {
+      /* a select, not a branch: no carry flag is live here, but keep the
+         shape of the q1 case below */
+      const uint32_t s0 = __shfl_sync (GM_FULL, A[0] * mp0, 0);
+      q0 = g.warp == 0 ? s0 : q0w;
+      q0w = q0;
+    }
+  else if constexpr (WIDE)
+    q0 = q0w;
+  else
+    q0 = __shfl_sync (GM_FULL, A[0] * mp0, 0, g.tpi);
   GM_P0 (A[0], A[1], q0, m[0]);
 #pragma unroll
   for (int k = 2; k < L; k += 2)
@@ -401,7 +573,19 @@ GM_DEV void gm_step2 (const gm_group &g, uint32_t (&A)[L + 3],
      the next chain (q1 * m_odd -> A) starts */
   const uint32_t w0 = A[0];
   U[0] = add_cc (U[0], A[1]);
-  uint32_t q1 = __shfl_sync (GM_FULL, U[0] * mp0, 0, g.tpi);
+  uint32_t q1;
+  if constexpr (WIDE && LEAD)
+    {
+      /* the carry of U[0] += A[1] is live until the chain below takes it:
+         select, don't branch */
+      const uint32_t s1 = __shfl_sync (GM_FULL, U[0] * mp0, 0);
+      q1 = g.warp == 0 ? s1 : q1w;
+      q1w = q1;
+    }
+  else if constexpr (WIDE)
+    q1 = q1w;
+  else
+    q1 = __shfl_sync (GM_FULL, U[0] * mp0, 0, g.tpi);
 
   /* q1 * m_odd -> A, shifted down two limbs */
 #pragma unroll
@@ -437,10 +621,24 @@ GM_DEV void gm_step2 (const gm_group &g, uint32_t (&A)[L + 3],
   }
 
   /* positions 0 and 1 of the lane above become our L-2 and L-1 (the top
-     lane gets lane 0's, which are zero) */
-  const uint32_t up = (g.lane + 1) & (g.tpi - 1);
-  uint32_t in0 = __shfl_sync (GM_FULL, w0, up, g.tpi);
-  uint32_t in1 = __shfl_sync (GM_FULL, w1, up, g.tpi);
+     lane gets lane 0's, which are zero; in a wide group the top lane of
+     each warp gets its words from the next warp later, see gm_mul_dist) */
+  uint32_t in0, in1;
+  if constexpr (WIDE)
+    {
+      w0o = w0;
+      w1o = w1;
+      in0 = __shfl_down_sync (GM_FULL, w0, 1);
+      in1 = __shfl_down_sync (GM_FULL, w1, 1);
+      if (g.wl == 31)
+        in0 = in1 = 0;
+    }
+  else
+    {
+      const uint32_t up = (g.lane + 1) & (g.tpi - 1);
+      in0 = __shfl_sync (GM_FULL, w0, up, g.tpi);
+      in1 = __shfl_sync (GM_FULL, w1, up, g.tpi);
+    }
   A[L-2] = add_cc (A[L-2], in0);
   A[L-1] = addc_cc (A[L-1], in1);
   A[L] = addc (A[L], 0);
@@ -470,7 +668,7 @@ GM_DEV void gm_mul_dist (const gm_group &g, uint32_t (&r)[L],
             {
               uint32_t t0 = __shfl_sync (GM_FULL, a[j], s, g.tpi);
               uint32_t t1 = __shfl_sync (GM_FULL, a[j + 1 < L ? j + 1 : 0], s, g.tpi);
-              gm_step2<L> (g, A, U, C, t0, t1, b, m, mp0);
+              gm_step2<L, false> (g, A, U, C, t0, t1, b, m, mp0, t0, t1, t0, t1);
             }
         }
     }
@@ -485,7 +683,7 @@ GM_DEV void gm_mul_dist (const gm_group &g, uint32_t (&r)[L],
             {
               uint32_t t0 = __shfl_sync (GM_FULL, a[e % L], s + e / L, g.tpi);
               uint32_t t1 = __shfl_sync (GM_FULL, a[(e + 1) % L], s + (e + 1) / L, g.tpi);
-              gm_step2<L> (g, A, U, C, t0, t1, b, m, mp0);
+              gm_step2<L, false> (g, A, U, C, t0, t1, b, m, mp0, t0, t1, t0, t1);
             }
         }
     }
@@ -499,34 +697,300 @@ GM_DEV void gm_mul_dist (const gm_group &g, uint32_t (&r)[L],
   gm_fold<L, false> (g, r, h);
 }
 
+/* Distributed Montgomery product over a wide group, "lead" form: the steps
+ * of gm_mul_dist, A's limbs read from shared memory, in blocks of KK steps
+ * per barrier.  Warp 0 (which holds lane 0, where the q come from) runs a
+ * block ahead and computes the q as gm_step2 does; at each barrier it
+ * publishes them for the other warps, which run the block it did last.
+ * The bottom lane of each warp publishes the words it shifted down to the
+ * warp below during its block; the top lane of that warp adds them a
+ * barrier later where they would have got to by then: R = 2 KK positions
+ * lower per block it has done since, so at L - 2R for warp 0 (L - R at the
+ * very end) and at L - R for the others.  They have not left the lane yet
+ * as long as 4 KK <= L, which sets KK. */
+template<int L, int K>
+GM_DEV void gm_mul_wide_lead (const gm_wgroup &g, uint32_t (&r)[L],
+                              const uint32_t (&a)[L], const uint32_t (&b)[L],
+                              const uint32_t (&m)[L], uint32_t mp0)
+{
+  static_assert (K == 1 || K == 2 || K == GM_WIDE_MAXK,
+                 "steps per barrier: 1, 2 or 4 (slot layout, tpi L / 2K)");
+  constexpr int KK = 4 * K <= L ? K : (L >= 8 ? 2 : 1);
+  constexpr int R = 2 * KK;
+  static_assert (L >= 4, "wide product needs L >= 4");
+#pragma unroll
+  for (int k = 0; k < L; k++)
+    g.sa[g.lane * L + k] = a[k];
+  g.sync ();
+
+  uint32_t A[L + 3], U[L + 2], C = 0;
+#pragma unroll
+  for (int k = 0; k < L + 3; k++)
+    A[k] = 0;
+#pragma unroll
+  for (int k = 0; k < L + 2; k++)
+    U[k] = 0;
+
+  const bool lead = g.warp == 0;
+  const bool late = g.wl == 31 && g.warp + 1 < g.nw;
+  const uint32_t nb = g.tpi * L / R;   /* tpi * L is a multiple of 64 */
+  const uint32_t *sp = g.slots ();
+#pragma unroll 1
+  for (uint32_t it = 0; ; it++)
+    {
+      /* the words from the warp above, published at the last barrier */
+      if (it >= 2)
+        {
+          uint32_t in[R];
+#pragma unroll
+          for (int i = 0; i < R; i++)
+            in[i] = late ? sp[GM_WS_IN + R * g.warp + i] : 0;
+          if (lead && it <= nb)
+            {
+              A[L-2*R] = add_cc (A[L-2*R], in[0]);
+#pragma unroll
+              for (int i = 1; i < R; i++)
+                A[L-2*R+i] = addc_cc (A[L-2*R+i], in[i]);
+#pragma unroll
+              for (int p = L - R; p < L; p++)
+                A[p] = addc_cc (A[p], 0);
+            }
+          else
+            {
+              A[L-R] = add_cc (A[L-R], in[0]);
+#pragma unroll
+              for (int i = 1; i < R; i++)
+                A[L-R+i] = addc_cc (A[L-R+i], in[i]);
+            }
+          A[L] = addc (A[L], 0);
+        }
+      if (it == nb + 1)
+        break;
+
+      /* warp 0: block it; the others: block it - 1, with warp 0's q */
+      uint32_t *s = g.slots ();
+      uint32_t q[R], wo[R];
+#pragma unroll
+      for (int i = 0; i < R; i++)
+        {
+          q[i] = 0;
+          wo[i] = 0;
+        }
+      const int bk = lead ? (int) it : (int) it - 1;
+      if (bk >= 0 && bk < (int) nb)
+        {
+          if (!lead)
+#pragma unroll
+            for (int i = 0; i < R; i++)
+              q[i] = sp[GM_WS_Q + i];
+#pragma unroll
+          for (int j = 0; j < KK; j++)
+            gm_step2<L, true, gm_wgroup, true> (g, A, U, C, g.sa[R * bk + 2*j],
+                               g.sa[R * bk + 2*j + 1], b, m, mp0,
+                               q[2*j], q[2*j+1], wo[2*j], wo[2*j+1]);
+        }
+      if (lead && g.wl == 0)
+#pragma unroll
+        for (int i = 0; i < R; i++)
+          s[GM_WS_Q + i] = q[i];
+      if (g.wl == 0 && g.warp > 0)
+#pragma unroll
+        for (int i = 0; i < R; i++)
+          s[GM_WS_IN + R * (g.warp - 1) + i] = wo[i];
+      sp = s;
+      g.exchange ();
+    }
+
+  /* r = A + U W + C, with the lane's overflow (position L) in h */
+  r[0] = add_cc (A[0], C);
+#pragma unroll
+  for (int k = 1; k < L; k++)
+    r[k] = addc_cc (A[k], U[k-1]);
+  uint32_t h = addc (A[L], U[L-1]);
+  gm_fold<L, false> (g, r, h);
+}
+
+/* Lane 0 of a wide group: the q of the next R rows (R/2 steps, R <= L),
+ * from the low R positions of the accumulator (A[0..] + U[0..] W + C) and
+ * the rows t: the unique q < W^R with acc + t x + q m = 0 mod W^R, which
+ * gm_step2 would find one word at a time.  Nothing else reaches those
+ * positions in the meantime: the words from lane 1 come in at L and up. */
+template<int L, int R>
+GM_DEV void gm_wide_qblock (const uint32_t (&A)[L + 3],
+                            const uint32_t (&U)[L + 2], uint32_t C,
+                            const uint32_t (&t)[R], const uint32_t (&x)[L],
+                            const uint32_t (&m)[L], uint32_t mp0,
+                            uint32_t (&q)[R])
+{
+  uint32_t w[R];
+  uint64_t c = (uint64_t) A[0] + C;
+  w[0] = (uint32_t) c;
+  c >>= 32;
+#pragma unroll
+  for (int i = 1; i < R; i++)
+    {
+      c += (uint64_t) A[i] + U[i-1];
+      w[i] = (uint32_t) c;
+      c >>= 32;
+    }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+    {
+      c = 0;
+#pragma unroll
+      for (int i = 0; r + i < R; i++)
+        {
+          c += (uint64_t) t[r] * x[i] + w[r + i];
+          w[r + i] = (uint32_t) c;
+          c >>= 32;
+        }
+      q[r] = w[r] * mp0;
+      c = 0;
+#pragma unroll
+      for (int i = 0; r + i < R; i++)
+        {
+          c += (uint64_t) q[r] * m[i] + w[r + i];
+          w[r + i] = (uint32_t) c;
+          c >>= 32;
+        }
+    }
+}
+
+/* The "block" form: all warps in step, KK steps (2 KK <= L rows) per
+ * barrier.  At each barrier lane 0 publishes the q of the next block
+ * (gm_wide_qblock), and the bottom lane of each warp the words it shifted
+ * down to the warp below during the last block; the top lane of that warp
+ * adds them where they would have got to, at positions L - 2KK .. L - 1,
+ * which they would not yet have left. */
+template<int L, int K>
+GM_DEV void gm_mul_wide_block (const gm_wgroup &g, uint32_t (&r)[L],
+                               const uint32_t (&a)[L], const uint32_t (&b)[L],
+                               const uint32_t (&m)[L], uint32_t mp0)
+{
+  static_assert (K == 1 || K == 2 || K == GM_WIDE_MAXK,
+                 "steps per barrier: 1, 2 or 4 (slot layout, tpi L / 2K)");
+  constexpr int KK = 2 * K <= L ? K : (L >= 8 ? 4 : (L >= 4 ? 2 : 1));
+  constexpr int R = 2 * KK;
+#pragma unroll
+  for (int k = 0; k < L; k++)
+    g.sa[g.lane * L + k] = a[k];
+  g.sync ();
+
+  uint32_t A[L + 3], U[L + 2], C = 0;
+#pragma unroll
+  for (int k = 0; k < L + 3; k++)
+    A[k] = 0;
+#pragma unroll
+  for (int k = 0; k < L + 2; k++)
+    U[k] = 0;
+
+  uint32_t wo[R];
+#pragma unroll
+  for (int i = 0; i < R; i++)
+    wo[i] = 0;
+  const uint32_t blocks = g.tpi * L / R;   /* tpi * L is a multiple of 64 */
+#pragma unroll 1
+  for (uint32_t bk = 0; bk <= blocks; bk++)
+    {
+      uint32_t t[R];
+      uint32_t *s = g.slots ();
+      if (bk < blocks)
+        {
+#pragma unroll
+          for (int i = 0; i < R; i++)
+            t[i] = g.sa[R * bk + i];
+          if (g.lane == 0)
+            {
+              uint32_t q[R];
+              gm_wide_qblock<L, R> (A, U, C, t, b, m, mp0, q);
+#pragma unroll
+              for (int i = 0; i < R; i++)
+                s[GM_WS_Q + i] = q[i];
+            }
+        }
+      if (g.wl == 0 && g.warp > 0)
+#pragma unroll
+        for (int i = 0; i < R; i++)
+          s[GM_WS_IN + R * (g.warp - 1) + i] = wo[i];
+      g.exchange ();
+      uint32_t in[R];
+      const bool late = g.wl == 31 && g.warp + 1 < g.nw;
+#pragma unroll
+      for (int i = 0; i < R; i++)
+        in[i] = late ? s[GM_WS_IN + R * g.warp + i] : 0;
+      A[L-R] = add_cc (A[L-R], in[0]);
+#pragma unroll
+      for (int i = 1; i < R; i++)
+        A[L-R+i] = addc_cc (A[L-R+i], in[i]);
+      A[L] = addc (A[L], 0);
+      if (bk == blocks)
+        break;
+#pragma unroll
+      for (int j = 0; j < KK; j++)
+        {
+          uint32_t q0 = s[GM_WS_Q + 2*j], q1 = s[GM_WS_Q + 2*j + 1];
+          gm_step2<L, true> (g, A, U, C, t[2*j], t[2*j+1], b, m, mp0,
+                             q0, q1, wo[2*j], wo[2*j+1]);
+        }
+    }
+
+  /* r = A + U W + C, with the lane's overflow (position L) in h */
+  r[0] = add_cc (A[0], C);
+#pragma unroll
+  for (int k = 1; k < L; k++)
+    r[k] = addc_cc (A[k], U[k-1]);
+  uint32_t h = addc (A[L], U[L-1]);
+  gm_fold<L, false> (g, r, h);
+}
+
+/* Wide product: the form and steps per barrier that measured fastest for
+   this L (gpu_dev/wide_mul_bench.cu; GM_WIDE_FORM/GM_WIDE_STEPS override). */
+template<int L>
+GM_DEV void gm_mul_dist (const gm_wgroup &g, uint32_t (&r)[L],
+                         const uint32_t (&a)[L], const uint32_t (&b)[L],
+                         const uint32_t (&m)[L], uint32_t mp0)
+{
+#if defined (GM_WIDE_FORM) && defined (GM_WIDE_STEPS)
+  if constexpr (GM_WIDE_FORM == 1)
+    gm_mul_wide_lead<L, GM_WIDE_STEPS> (g, r, a, b, m, mp0);
+  else
+    gm_mul_wide_block<L, GM_WIDE_STEPS> (g, r, a, b, m, mp0);
+#else
+  if constexpr (gm_wide_lead_better (L))
+    gm_mul_wide_lead<L, 4> (g, r, a, b, m, mp0);
+  else
+    gm_mul_wide_block<L, 2> (g, r, a, b, m, mp0);
+#endif
+}
+
 /* r = a * b / R mod m (lazy, see top of file).  r may alias a or b. */
-template<int L, bool SOLO>
-GM_DEV void gm_mul (const gm_group &g, uint32_t (&r)[L],
+template<int L, bool SOLO, class G>
+GM_DEV void gm_mul (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&b)[L],
                     const uint32_t (&m)[L], uint32_t mp0)
 {
-  if (!SOLO && L >= 2)
-    {
-      gm_mul_dist<L> (g, r, a, b, m, mp0);
-      return;
-    }
-  uint32_t acc[L];
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    acc[k] = 0;
-  uint32_t c = 0;
-  if (SOLO)
-    gm_rows<L, SOLO, 0>::run (g, acc, c, 0, a, b, m, mp0);
+  if constexpr (!SOLO && L >= (G::wide ? 4 : 2))
+    gm_mul_dist<L> (g, r, a, b, m, mp0);
   else
     {
-#pragma unroll 1
-      for (uint32_t s = 0; s < g.tpi; s++)
-        gm_rows<L, SOLO, 0>::run (g, acc, c, s, a, b, m, mp0);
-    }
-  gm_fold<L, SOLO> (g, acc, c);
+      uint32_t acc[L];
 #pragma unroll
-  for (int k = 0; k < L; k++)
-    r[k] = acc[k];
+      for (int k = 0; k < L; k++)
+        acc[k] = 0;
+      uint32_t c = 0;
+      if (SOLO)
+        gm_rows<L, SOLO, 0>::run (g, acc, c, 0, a, b, m, mp0);
+      else
+        {
+#pragma unroll 1
+          for (uint32_t s = 0; s < g.tpi; s++)
+            gm_rows<L, SOLO, 0>::run (g, acc, c, s, a, b, m, mp0);
+        }
+      gm_fold<L, SOLO> (g, acc, c);
+#pragma unroll
+      for (int k = 0; k < L; k++)
+        r[k] = acc[k];
+    }
 }
 
 /* t += a * x[j] W^(base + j) for j = j0, j0 + 2, ... < L as one
@@ -638,8 +1102,8 @@ GM_DEV void gm_sqr_solo (uint32_t (&r)[L], const uint32_t (&a)[L],
     r[k] = t[L + k];
 }
 
-template<int L, bool SOLO>
-GM_DEV void gm_sqr (const gm_group &g, uint32_t (&r)[L],
+template<int L, bool SOLO, class G>
+GM_DEV void gm_sqr (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&m)[L],
                     uint32_t mp0)
 {
@@ -650,8 +1114,8 @@ GM_DEV void gm_sqr (const gm_group &g, uint32_t (&r)[L],
 }
 
 /* r = a * d / 2^32 mod m for a 32-bit d (lazy: r < a + m). */
-template<int L, bool SOLO>
-GM_DEV void gm_mul_ui (const gm_group &g, uint32_t (&r)[L],
+template<int L, bool SOLO, class G>
+GM_DEV void gm_mul_ui (const G &g, uint32_t (&r)[L],
                        const uint32_t (&a)[L], uint32_t d,
                        const uint32_t (&m)[L], uint32_t mp0)
 {

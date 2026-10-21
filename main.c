@@ -1366,6 +1366,10 @@ main (int argc, char *argv[])
               mpz_set (B2min, startingB2min);
             }
 
+          /* the GPU code replaces a curve count of 0 by what fills the GPU
+             for this number, which depends on its size: ask again */
+          params->gpu_number_of_curves = gpucurves;
+
             /* "blank" lines, or lines that could not be parsed correctly 
                will leave a 1 in this value */
             if (n.isPrp)

@@ -37,8 +37,12 @@ size_t gpu_ecm_stage1_max_bits (void);
    configuration handle (>= 0) for gpu_ecm_stage1, or ECM_ERROR. */
 int gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose);
 
-/* (TPI, L) of a configuration from gpu_ecm_stage1_plan */
+/* (TPI, L) of a configuration from gpu_ecm_stage1_plan; TPI = 0 for the
+   NTT path */
 void gpu_ecm_plan_shape (int config, uint32_t *tpi, uint32_t *L);
+
+/* The NTT tables of a configuration on the NTT path, else NULL */
+struct gpu_ntt_plan *gpu_ecm_plan_ntt (int config);
 
 /* Stage 1 for CURVES curves: multiply each curve's point by S.  Curve i has
    sigma + i, or sigmas[i] when SIGMAS is not NULL.  The points start at

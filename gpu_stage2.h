@@ -38,6 +38,10 @@ extern "C" {
    x = X/Z are in xs[].  For each curve where a factor is found, xs[i] is
    replaced by it and array_found[i] set.  CONFIG is from
    gpu_ecm_stage1_plan. */
+/* Whether stage 2 can run on the GPU for CONFIG (from
+   gpu_ecm_stage1_plan) */
+int gpu_ecm_stage2_supported (int config);
+
 int gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
                     const mpz_t B2min, const mpz_t B2,
                     uint32_t curves, uint32_t sigma,

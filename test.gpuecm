@@ -104,9 +104,29 @@ checkcode $? 0
 echo "2^24571-1" | $ECM -sigma 3:92 4 0
 checkcode $? 0
 
-# 2^24572+1 has 24573 bits: too large (exit code 1)
+# 2^24572+1 has 24573 bits: more than one warp per curve (the wide or NTT
+# kernels); 17 divides it
 echo "2^24572+1" | $ECM -sigma 3:92 4 0
+checkcode $? 6
+
+# 2^262140+1 has 262141 bits: too large (exit code 1)
+echo "2^262140+1" | $ECM -sigma 3:92 4 0
 checkcode $? 1
+
+# Two numbers of different sizes in one run, with the curve count left to
+# the GPU code: each must get the count that fills the GPU for its own size
+# (not the first number's).  (2^1279-1)^24 has no factor ECM can find.
+printf "2^1279-1\n(2^1279-1)^24\n" | ${1:-./ecm} -gpu -sigma 3:100 20 100 > test.gpuecm.out
+checkcode $? 0
+c1=$(grep -o 'Computing [0-9]* Step 1' test.gpuecm.out | sed -n 1p)
+c2=$(grep -o 'Computing [0-9]* Step 1' test.gpuecm.out | sed -n 2p)
+if [ -z "$c2" ] || [ "$c1" = "$c2" ]
+then
+  echo "############### ERROR ###############"
+  echo "Expected curve counts for each size, got \"$c1\" and \"$c2\""
+  exit 1
+fi
+/bin/rm -f test.gpuecm.out
 
 # test for when stage 2 is needed.  GPU stage 2 covers exactly the primes
 # <= B2; on curve 3 the point's order mod the factor is 1423.
@@ -182,7 +202,9 @@ checkcode $? 6
 # GPU) gives exactly the residues of a run from scratch to the new B1, and a
 # reordered subset with non-consecutive sigmas does too
 echo "(2^521-1)*(2^607-1)" | $ECM -sigma 3:5000 -save test.gpu1.save 1e4 0
+checkcode $? 0
 echo "(2^521-1)*(2^607-1)" | $ECM -sigma 3:5000 -save test.gpu2.save 1e3 0
+checkcode $? 0
 $ECM -resume test.gpu2.save -save test.gpu3.save 1e4 0
 checkcode $? 0
 grep -o 'X=0x[0-9a-f]*' test.gpu1.save > test.gpu1.x
@@ -196,6 +218,12 @@ fi
 grep 'X=' test.gpu2.save | awk 'NR % 3 == 1' | sort -r > test.gpu4.save
 $ECM -resume test.gpu4.save -save test.gpu5.save 1e4 0
 checkcode $? 0
+if [ $(grep -c 'X=' test.gpu4.save) != 11 ] || [ $(grep -c 'X=' test.gpu5.save) != 11 ]
+then
+  echo "############### ERROR ###############"
+  echo "Expected 11 resumed residues"
+  exit 1
+fi
 for line in $(sed -n -e 's/.*SIGMA=\([0-9]*\);.*X=\(0x[0-9a-f]*\).*/\1:\2/p' test.gpu5.save)
 do
   if ! grep -q "SIGMA=${line%%:*};.*X=${line#*:}" test.gpu1.save

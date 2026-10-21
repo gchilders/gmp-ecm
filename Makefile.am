@@ -55,7 +55,7 @@ libecm_la_LIBADD = $(MULREDCLIBRARY)
 if WANT_GPU 
   libecm_la_SOURCES += cudacommon.cu
   libecm_la_SOURCES += gpu_stage1.cu
-  libecm_la_SOURCES += gpu_stage2.cu gpu_kernels.cu \
+  libecm_la_SOURCES += gpu_stage2.cu gpu_ntt.cu gpu_kernels.cu \
                        gpu_kset_00.cu gpu_kset_01.cu gpu_kset_02.cu gpu_kset_03.cu gpu_kset_04.cu gpu_kset_05.cu gpu_kset_06.cu gpu_kset_07.cu gpu_kset_08.cu gpu_kset_09.cu gpu_kset_10.cu gpu_kset_11.cu gpu_kset_12.cu gpu_kset_13.cu
   libecm_la_LIBADD += $(CUDALIB)
   libecm_la_LDFLAGS += $(CUDALDFLAGS)
@@ -112,6 +112,7 @@ noinst_HEADERS = basicdefs.h ecm-impl.h ecm-gmp.h ecm-ecm.h sp.h longlong.h \
                  ecm-params.h mpmod.h ecm-gpu.h torsions.h \
                  cudacommon.h gpu_stage1.h gpu_stage2.h gpu_mont.cuh gpu_common.cuh \
                  gpu_kernels.h gpu_kset.cuh gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh \
+                 gpu_ntt.h gpu_ntt.cuh \
                  addlaws.h getprime_r.h ecm_int.h \
                  aprtcle/mpz_aprcl.h aprtcle/jacobi_sum.h
 
@@ -136,8 +137,10 @@ if WANT_GPU
 .cu.lo:
 		$(LIBTOOL) --tag=CC --mode=compile $(NVCC) --compile $(NVCCFLAGS) --compiler-options -fPIC $(CPPFLAGS) -o $@ $< -static
 
-gpu_stage1.lo: gpu_stage1.h gpu_kernels.h gpu_common.cuh cudacommon.h
-gpu_stage2.lo: gpu_stage1.h gpu_stage2.h gpu_kernels.h gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh cudacommon.h
+cudacommon.lo: cudacommon.h ecm-gpu.h ecm-ecm.h
+gpu_stage1.lo: gpu_stage1.h gpu_kernels.h gpu_ntt.h gpu_common.cuh cudacommon.h ecm.h ecm-gpu.h
+gpu_ntt.lo: gpu_ntt.h gpu_ntt.cuh gpu_common.cuh cudacommon.h
+gpu_stage2.lo: gpu_stage1.h gpu_stage2.h gpu_kernels.h gpu_ntt.h gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh cudacommon.h ecm.h ecm-gpu.h getprime_r.h
 gpu_kernels.lo: gpu_kernels.h gpu_common.cuh
 gpu_kset_00.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 gpu_kset_01.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh

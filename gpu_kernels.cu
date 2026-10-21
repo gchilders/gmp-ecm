@@ -63,7 +63,10 @@ gpu_kernels (uint32_t tpi, uint32_t L)
   const gpu_kernel_set *k;
   if (tpi == 1)
     k = (L >= 1 && L <= GPU_SOLO_MAX_L) ? &t.solo[L] : NULL;
-  else
+  else if (tpi <= 32)
     k = (L >= 1 && L <= GPU_DIST_MAX_L) ? &t.dist[L] : NULL;
+  else
+    k = (tpi <= GPU_WIDE_MAX_TPI && L >= 2 && L <= GPU_DIST_MAX_L)
+        ? &t.wide[L] : NULL;
   return (k != NULL && k->s1 != NULL) ? k : NULL;
 }

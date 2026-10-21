@@ -27,9 +27,9 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include "gpu_common.cuh"
 #include "gpu_mont.cuh"
 
-template<int L, bool SOLO>
+template<int L, bool SOLO, class G>
 __device__ __forceinline__ void
-ladder_step (const gm_group &g,
+ladder_step (const G &g,
              uint32_t (&aX)[L], uint32_t (&aZ)[L],
              uint32_t (&bX)[L], uint32_t (&bZ)[L],
              uint32_t d, const uint32_t (&N)[L], const uint32_t (&N2)[L],
@@ -94,20 +94,17 @@ swap_limbs (uint32_t (&a)[L], uint32_t (&b)[L])
  * ladder runs from (P, 2P) with P = (2 : 1), or with P = (x0 : 1) for a
  * resumed curve when x0g (n limbs per curve, Montgomery form) is given.
  * Every thread of the grid owns a real (or padding) curve: no early exits,
- * the shuffles need whole warps. */
-template<int L, bool SOLO>
-__global__ void __launch_bounds__ (GPU_TPB)
-gpu_stage1_kernel (const uint32_t * __restrict__ s_bits, uint64_t s_nbits,
-                   uint64_t b_start, uint64_t b_count,
-                   uint32_t * __restrict__ data,
-                   const uint32_t * __restrict__ Ng,
-                   uint32_t np0, uint32_t sigma0, uint32_t tpi,
-                   const uint32_t * __restrict__ dlist,
-                   const uint32_t * __restrict__ x0g)
+ * the shuffles and barriers need whole groups. */
+template<int L, bool SOLO, class G>
+__device__ __forceinline__ void
+gpu_stage1_body (const G &g, const uint32_t * __restrict__ s_bits,
+                 uint64_t s_nbits, uint64_t b_start, uint64_t b_count,
+                 uint32_t * __restrict__ data,
+                 const uint32_t * __restrict__ Ng,
+                 uint32_t np0, uint32_t sigma0,
+                 const uint32_t * __restrict__ dlist,
+                 const uint32_t * __restrict__ x0g)
 {
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
-
   const uint32_t inst = (blockIdx.x * blockDim.x + threadIdx.x) / g.tpi;
   const uint32_t n = g.tpi * L;
   const uint32_t off = g.lane * L;
@@ -156,6 +153,41 @@ gpu_stage1_kernel (const uint32_t * __restrict__ s_bits, uint64_t s_nbits,
       dp[2 * n + k] = bX[k];
       dp[3 * n + k] = bZ[k];
     }
+}
+
+/* TPI = 1 (SOLO) or 2..32 threads per curve, within a warp */
+template<int L, bool SOLO>
+__global__ void __launch_bounds__ (GPU_TPB)
+gpu_stage1_kernel (const uint32_t * __restrict__ s_bits, uint64_t s_nbits,
+                   uint64_t b_start, uint64_t b_count,
+                   uint32_t * __restrict__ data,
+                   const uint32_t * __restrict__ Ng,
+                   uint32_t np0, uint32_t sigma0, uint32_t tpi,
+                   const uint32_t * __restrict__ dlist,
+                   const uint32_t * __restrict__ x0g)
+{
+  gm_group g;
+  g.init (SOLO ? 1 : tpi);
+  gpu_stage1_body<L, SOLO> (g, s_bits, s_nbits, b_start, b_count, data, Ng,
+                            np0, sigma0, dlist, x0g);
+}
+
+/* TPI = 64 or 128 threads per curve (gm_wgroup) */
+template<int L>
+__global__ void __launch_bounds__ (GPU_TPB)
+gpu_stage1_wide_kernel (const uint32_t * __restrict__ s_bits, uint64_t s_nbits,
+                        uint64_t b_start, uint64_t b_count,
+                        uint32_t * __restrict__ data,
+                        const uint32_t * __restrict__ Ng,
+                        uint32_t np0, uint32_t sigma0, uint32_t tpi,
+                        const uint32_t * __restrict__ dlist,
+                        const uint32_t * __restrict__ x0g)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  gpu_stage1_body<L, false> (g, s_bits, s_nbits, b_start, b_count, data, Ng,
+                             np0, sigma0, dlist, x0g);
 }
 
 #endif /* _GPU_STAGE1_KERNEL_CUH */

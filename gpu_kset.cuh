@@ -43,6 +43,29 @@ struct gpu_kset_fill<L, HI, SOLO, true> {
   static void run (gpu_kernel_set *) {}
 };
 
+/* wide groups: stage 1 for L >= 2, stage 2 for L >= 7 */
+template<int L, int HI, bool DONE = (L > HI)>
+struct gpu_kset_fill_wide {
+  static void run (gpu_kernel_set *t)
+  {
+    if constexpr (L >= 2)
+      t[L].s1 = gpu_stage1_wide_kernel<L>;
+    /* stage 2 only for the shapes chosen above the one-warp sizes:
+       64 threads with L >= 13, 128 with L >= 7 */
+    if constexpr (L >= 7)
+      {
+        t[L].s2_setup = s2_setup_wide_kernel<L>;
+        t[L].s2_norm = s2_norm_wide_kernel<L>;
+        t[L].s2_main = s2_main_wide_kernel<L>;
+      }
+    gpu_kset_fill_wide<L + 1, HI>::run (t);
+  }
+};
+template<int L, int HI>
+struct gpu_kset_fill_wide<L, HI, true> {
+  static void run (gpu_kernel_set *) {}
+};
+
 #define GPU_KSET_NAME2(n) gpu_kset_ ## n
 #define GPU_KSET_NAME(n) GPU_KSET_NAME2 (n)
 
@@ -53,5 +76,6 @@ void GPU_KSET_NAME (GPU_KSET) (gpu_kernel_table *t)
 #endif
 #if GPU_KSET_DIST_LO <= GPU_KSET_DIST_HI
   gpu_kset_fill<GPU_KSET_DIST_LO, GPU_KSET_DIST_HI, false>::run (t->dist);
+  gpu_kset_fill_wide<GPU_KSET_DIST_LO, GPU_KSET_DIST_HI>::run (t->wide);
 #endif
 }

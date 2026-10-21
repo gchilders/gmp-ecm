@@ -56,10 +56,12 @@ struct gpu_kernel_set {
 struct gpu_kernel_table {
   gpu_kernel_set solo[GPU_SOLO_MAX_L + 1];
   gpu_kernel_set dist[GPU_DIST_MAX_L + 1];
+  gpu_kernel_set wide[GPU_DIST_MAX_L + 1];   /* stage 2 for L >= 7 only */
 };
 
-/* Kernels for TPI threads per curve (1 = solo) and L limbs per thread, or
-   NULL if not compiled. */
+/* Kernels for TPI threads per curve (1 = solo, up to GPU_WIDE_MAX_TPI) and
+   L limbs per thread, or NULL if not compiled.  Above 32 threads per curve
+   the stage 2 kernels are NULL for L < 7. */
 const gpu_kernel_set *gpu_kernels (uint32_t tpi, uint32_t L);
 
 #endif /* _GPU_KERNELS_H */

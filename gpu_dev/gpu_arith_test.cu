@@ -3,7 +3,8 @@
    nvcc -O2 -arch=sm_89 -o gpu_arith_test gpu_arith_test.cu -lgmp
    ./gpu_arith_test [iterations]
 
-   Every op is run for many (TPI, L) shapes on random and adversarial
+   Every op is run for many (TPI, L) shapes, wide groups (TPI = 64, 128)
+   included, on random and adversarial
    inputs (all-ones / all-zero limbs, N = 2^k +- 1, N close to the top of
    the allowed range), and checked for value mod N and for its output bound.
 */
@@ -22,14 +23,12 @@
 enum { OP_MUL, OP_SQR, OP_ADD, OP_SUB, OP_MULUI, OP_DBL, OP_COUNT };
 static const char *op_name[] = { "mul", "sqr", "add", "sub", "mul_ui", "dbl" };
 
-template<int L, bool SOLO>
-__global__ void
-test_kernel (int op, uint32_t tpi, uint32_t count, const uint32_t *A,
-             const uint32_t *B, const uint32_t *Ng, uint32_t np0,
-             const uint32_t *D, uint32_t *out)
+template<int L, bool SOLO, class G>
+__device__ void
+test_body (const G &g, int op, uint32_t count, const uint32_t *A,
+           const uint32_t *B, const uint32_t *Ng, uint32_t np0,
+           const uint32_t *D, uint32_t *out)
 {
-  gm_group g;
-  g.init (SOLO ? 1 : tpi);
   uint32_t inst = (blockIdx.x * blockDim.x + threadIdx.x) / g.tpi;
   uint32_t n = g.tpi * L;
   uint32_t ci = inst < count ? inst : count - 1;  /* keep warps whole */
@@ -54,6 +53,30 @@ test_kernel (int op, uint32_t tpi, uint32_t count, const uint32_t *A,
   if (inst < count)
     for (int k = 0; k < L; k++)
       out[(size_t) inst * n + off + k] = r[k];
+}
+
+template<int L, bool SOLO>
+__global__ void
+test_kernel (int op, uint32_t tpi, uint32_t count, const uint32_t *A,
+             const uint32_t *B, const uint32_t *Ng, uint32_t np0,
+             const uint32_t *D, uint32_t *out)
+{
+  gm_group g;
+  g.init (SOLO ? 1 : tpi);
+  test_body<L, SOLO> (g, op, count, A, B, Ng, np0, D, out);
+}
+
+/* wide groups; blocks of 128 threads */
+template<int L>
+__global__ void
+test_wide_kernel (int op, uint32_t tpi, uint32_t count, const uint32_t *A,
+                  const uint32_t *B, const uint32_t *Ng, uint32_t np0,
+                  const uint32_t *D, uint32_t *out)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (128, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  test_body<L, false> (g, op, count, A, B, Ng, np0, D, out);
 }
 
 static gmp_randstate_t rs;
@@ -117,7 +140,7 @@ rand_mod (mpz_t N, uint32_t n, int style)
 
 static int failures = 0;
 
-template<int L, bool SOLO>
+template<int L, bool SOLO, bool WIDE = false>
 static void
 run_shape (uint32_t tpi, int iters)
 {
@@ -181,7 +204,10 @@ run_shape (uint32_t tpi, int iters)
         CK (cudaMemcpy (gN, Nn.data (), Nn.size () * 4, cudaMemcpyHostToDevice));
         CK (cudaMemcpy (gD, D.data (), D.size () * 4, cudaMemcpyHostToDevice));
         uint32_t threads = count * tpi;
-        test_kernel<L, SOLO><<<(threads + 127) / 128, 128>>> (op, tpi, count, gA, gB, gN, 0, gD, gO);
+        if (WIDE)
+          test_wide_kernel<L><<<(threads + 127) / 128, 128>>> (op, tpi, count, gA, gB, gN, 0, gD, gO);
+        else
+          test_kernel<L, SOLO><<<(threads + 127) / 128, 128>>> (op, tpi, count, gA, gB, gN, 0, gD, gO);
         CK (cudaGetLastError ());
         CK (cudaMemcpy (O.data (), gO, O.size () * 4, cudaMemcpyDeviceToHost));
 
@@ -250,6 +276,14 @@ run_dist (int iters)
     run_shape<L, false> (tpi, iters);
 }
 
+template<int L>
+static void
+run_wide (int iters)
+{
+  run_shape<L, false, true> (64, iters);
+  run_shape<L, false, true> (128, iters);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -274,6 +308,15 @@ main (int argc, char **argv)
   run_dist<8> (iters);
   run_dist<16> (iters);
   run_dist<24> (iters);
+
+  run_wide<2> (iters);
+  run_wide<3> (iters);
+  run_wide<4> (iters);
+  run_wide<7> (iters);
+  run_wide<8> (iters);
+  run_wide<13> (iters);
+  run_wide<16> (iters);
+  run_wide<24> (iters);
 
   printf ("%s (%d failures)\n", failures ? "FAILED" : "ALL OK", failures);
   return failures != 0;
