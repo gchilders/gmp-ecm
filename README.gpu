@@ -86,29 +86,26 @@ To use your GPU for step 1, just add the -gpu option:
 
 It will compute both step 1 and step 2 on the GPU.
 
-Step 2 on the GPU is a baby-step giant-step prime continuation, for inputs
-of every size step 1 takes: it covers exactly the primes in (B2min, B2], at a
-cost linear in B2.  Its default B2 is
-therefore 100 * B1, much smaller than the CPU default (which is tuned for the
-CPU's FFT continuation, whose cost grows much more slowly with B2).  A B2 given
-on the command line is always used as is.
+Step 2 on the GPU is GMP-ECM's own FFT continuation (the same polynomials and
+the same numbers as its step 2 on the CPU: the same "Product of G(f_i)" at
+-v -v -v, the same factors), with its default B2 and Brent-Suyama polynomial,
+for inputs up to 98300 bits.  It always uses the parameters of GMP-ECM's NTT
+step 2 (dF a power of 2), lowered if needed to fit the GPU memory; to compare
+with the CPU above 1920 bits, give the CPU run "-ntt".
+
+Above 98300 bits, or without enough GPU memory, step 2 is a baby-step
+giant-step prime continuation on the GPU instead; "-gpubsgs" asks for it at
+any size.  It covers exactly the primes in (B2min, B2], at a cost linear in
+B2, so its default B2 is 100 * B1, much smaller than the default for the FFT
+continuation.  For a given factor size the FFT continuation needs a half to
+two thirds as many curves (with its larger B2) for about the same time per
+curve: on an A10 it finds a factor 1.6 to 2.3 times as fast, from 300 to
+65536 bits.
 
 To do step 2 on the CPU instead (one curve at a time, with the FFT
 continuation and the usual default B2), add "-cpustage2":
 
   $ echo "(2^835+1)/33" | ./ecm -gpu -cpustage2 1e4
-
-"-gpupoly" (instead of "-gpu") runs that FFT continuation on the GPU: the
-same polynomials and the same numbers as GMP-ECM's stage 2 on the CPU
-(the same "Product of G(f_i)" at -v -v -v, the same factors), with its
-default B2 and Brent-Suyama polynomial, curve by curve.  It always uses the
-parameters of GMP-ECM's NTT stage 2 (dF a power of 2), lowered if needed to
-fit the GPU memory; to compare with the CPU above 1920 bits, give the CPU
-run "-ntt".  It takes inputs up to 98300 bits; above that, or without enough
-GPU memory, step 2 runs on the CPU.  It is not yet tuned (curves are not
-batched), and not yet the default.
-
-  $ echo "(2^835+1)/33" | ./ecm -gpupoly 1e6
 
 The only parametrization compatible with GPU code is "-param 3".
 

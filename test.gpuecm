@@ -113,6 +113,18 @@ checkcode $? 6
 echo "2^262140+1" | $ECM -sigma 3:92 4 0
 checkcode $? 1
 
+# above 98300 bits the polynomial stage 2 cannot run: the default falls back
+# to the baby-step giant-step one (chosen before step 1, so the message is
+# there whatever the curves find)
+echo "2^100019-1" | $ECM -sigma 3:92 4 400 > test.gpuecm.out
+if ! grep -q "baby-step giant-step stage 2" test.gpuecm.out
+then
+  echo "############### ERROR ###############"
+  echo "Expected the baby-step giant-step stage 2 above 98300 bits"
+  exit 1
+fi
+rm -f test.gpuecm.out
+
 # Two numbers of different sizes in one run, with the curve count left to
 # the GPU code: each must get the count that fills the GPU for its own size
 # (not the first number's).  (2^1279-1)^24 has no factor ECM can find.
@@ -128,25 +140,27 @@ then
 fi
 /bin/rm -f test.gpuecm.out
 
-# test for when stage 2 is needed.  GPU stage 2 covers exactly the primes
-# <= B2; on curve 3 the point's order mod the factor is 1423.
-echo "2^349-1" | $ECM -sigma 3:13 587 1423
+# test for when stage 2 is needed.  The baby-step giant-step GPU stage 2
+# covers exactly the primes <= B2; on curve 3 the point's order mod the
+# factor is 1423.
+echo "2^349-1" | $ECM -gpubsgs -sigma 3:13 587 1423
 checkcode $? 6
 
 # same with stage 2 on the CPU (its FFT continuation rounds B2 up to 1446)
 echo "2^349-1" | $ECM -cpustage2 -sigma 3:13 587 1261
 checkcode $? 6
 
-# GPU stage 2 with D=2310: exactly curves 9, 27 and 28 find 2^40-87 in
-# step 2 (checked independently with gpu_dev/gpu_s2_check.py)
-echo "(2^40-87)*(2^521-1)" | $ECM -sigma 3:1224 4000 200000 > test.gpuecm.out
+# baby-step giant-step GPU stage 2 with D=2310: exactly curves 9, 27 and 28
+# find 2^40-87 in step 2 (checked independently with
+# gpu_dev/gpu_s2_check.py)
+echo "(2^40-87)*(2^521-1)" | $ECM -gpubsgs -sigma 3:1224 4000 200000 > test.gpuecm.out
 checkcode $? 14
 checkfactorcount test.gpuecm.out 0 3 1
 rm -f test.gpuecm.out
 
-# the polynomial GPU stage 2 (GMP-ECM's own stage 2, effective B2 = 225426
-# here) finds it with the same curves as the CPU's
-echo "(2^40-87)*(2^521-1)" | $ECM -gpupoly -sigma 3:1224 4000 200000 > test.gpuecm.out
+# the default, polynomial GPU stage 2 (GMP-ECM's own stage 2, effective
+# B2 = 225426 here) finds it with the same curves as the CPU's
+echo "(2^40-87)*(2^521-1)" | $ECM -sigma 3:1224 4000 200000 > test.gpuecm.out
 checkcode $? 14
 checkfactorcount test.gpuecm.out 0 3 1
 rm -f test.gpuecm.out

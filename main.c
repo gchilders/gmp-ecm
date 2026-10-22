@@ -143,11 +143,11 @@ usage (void)
     printf ("  -bloadms file With -param 1-3, mmap stage 1 exponent from file.\n");
 #endif
 #ifdef WITH_GPU
-    printf ("  -gpu         Use the GPU for stage 1 and stage 2 (default B2 = %d*B1).\n",
-            GPU_STAGE2_DEFAULT_B2_FACTOR);
+    printf ("  -gpu         Use the GPU for stage 1 and stage 2 (stage 2: the FFT\n"
+            "               continuation, GMP-ECM's default B2).\n");
+    printf ("  -gpubsgs     With -gpu, a baby-step giant-step stage 2 on the GPU\n"
+            "               (default B2 = %d*B1).\n", GPU_STAGE2_DEFAULT_B2_FACTOR);
     printf ("  -cpustage2   With -gpu, do stage 2 on the CPU (FFT continuation).\n");
-    printf ("  -gpupoly     Like -gpu, with the FFT continuation (GMP-ECM's stage 2,\n"
-            "               default B2) on the GPU.\n");
     printf ("  -gpudevice n Use device n to execute GPU code (by default, "
                                                           "CUDA chooses)\n");
     printf ("  -gpucurves n Compute on n curves in parallel on the GPU (by "
@@ -550,7 +550,7 @@ main (int argc, char *argv[])
 #endif
   int use_gpu = 0; /* Do we use the GPU for stage 1 (by default no) */
   int cpu_stage2 = 0; /* With -gpu, do stage 2 on the CPU instead */
-  int gpu_poly = 0;   /* With -gpu, the polynomial GPU stage 2 */
+  int gpu_bsgs = 0;   /* With -gpu, the baby-step giant-step GPU stage 2 */
   int gpu_mode = 0;   /* params->gpu for GPU runs (a resumed residue the GPU
                          cannot take clears params->gpu for its one run) */
   int gpudevice = -1; /* Which device do we use for GPU code (by default CUDA */
@@ -989,8 +989,15 @@ main (int argc, char *argv[])
         }
       else if (strcmp (argv[1], "-gpupoly") == 0)
         {
+          /* the default with -gpu; kept as an option */
           use_gpu = 1;
-          gpu_poly = 1;
+          argv++;
+          argc--;
+        }
+      else if (strcmp (argv[1], "-gpubsgs") == 0)
+        {
+          use_gpu = 1;
+          gpu_bsgs = 1;
           argv++;
           argc--;
         }
@@ -1157,7 +1164,7 @@ main (int argc, char *argv[])
   params->stage1time = stage1time;
   /* If WITH_GPU is not defined it will always be 0.  1: both stages on the
      GPU, 2: stage 1 on the GPU and stage 2 on the CPU. */
-  gpu_mode = use_gpu ? (cpu_stage2 ? 2 : gpu_poly ? 3 : 1) : 0;
+  gpu_mode = use_gpu ? (cpu_stage2 ? 2 : gpu_bsgs ? 1 : 3) : 0;
   params->gpu = gpu_mode;
   params->gpu_device = gpudevice; /* If WITH_GPU is not defined or    */
                                   /* use_gpu = 0, it has no meaning   */

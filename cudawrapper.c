@@ -288,12 +288,12 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   mpz_init (B2);
   mpz_init (B2min);
 
-  /* params->gpu == 1: stage 2 on the GPU too (baby-step giant-step); 2:
-     stage 2 on the CPU; 3: the polynomial stage 2 on the GPU.  The
-     baby-step giant-step stage 2 costs time linear in B2, so its default
-     B2 is a fixed multiple of B1 rather than the CPU's (much larger)
-     default.  The polynomial one takes GMP-ECM's own parameters, with
-     the power-of-2 dF of its NTT stage 2. */
+  /* params->gpu == 3 (the default with -gpu): the polynomial stage 2 on
+     the GPU, with GMP-ECM's own parameters (the power-of-2 dF of its NTT
+     stage 2); where it cannot run, the baby-step giant-step one.  1: the
+     baby-step giant-step stage 2 on the GPU; it costs time linear in B2,
+     so its default B2 is a fixed multiple of B1 rather than the CPU's
+     (much larger) default.  2: stage 2 on the CPU. */
   gpu_poly = (params->gpu == 3);
   gpu_stage2 = (params->gpu == 1 || gpu_poly);
   mpz_init_set (B2_parm, params->B2);
@@ -379,9 +379,37 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       unsigned long fit = gpu_ecm_stage2_poly_fit (n, dF);
       if (fit == 0)
         {
-          outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (no polynomial "
-                   "GPU stage 2 for this size)\n");
-          gpu_stage2 = gpu_poly = 0;
+          /* the baby-step giant-step stage 2 instead, with its own
+             parameters (as for params->gpu == 1 above) */
+          outputf (OUTPUT_NORMAL, "GPU: baby-step giant-step stage 2 (no "
+                   "polynomial GPU stage 2 for this size)\n");
+          gpu_poly = 0;
+          mpz_set (B2_parm, params->B2);
+          if (!ECM_IS_DEFAULT_B2 (B2_parm) && mpz_sizeinbase (B2_parm, 2) > 62)
+            {
+              outputf (OUTPUT_NORMAL, "GPU: stage 2 on the CPU (B2 above "
+                       "2^62 is too large for GPU stage 2)\n");
+              gpu_stage2 = 0;
+            }
+          if (gpu_stage2 && ECM_IS_DEFAULT_B2 (B2_parm))
+            mpz_set_d (B2_parm, GPU_STAGE2_DEFAULT_B2_FACTOR * B1);
+          mpz_clear (root_params.i0);
+          mutable_params->k = k_parm;
+          youpi = set_stage_2_params (B2, B2_parm, B2min, params->B2min,
+                                      &root_params, B1, &mutable_params->k,
+                                      params->S, params->use_ntt, &po2, &dF,
+                                      params->TreeFilename, params->maxmem,
+                                      Fermat, modulus);
+          if (youpi == ECM_ERROR)
+            {
+              mpz_clear (B2_parm);
+              goto end_gpu_ecm;
+            }
+          if (gpu_stage2)
+            {
+              mpz_set (B2, B2_parm);
+              root_params.S = 1;
+            }
         }
       else if (fit < dF)
         {
