@@ -6,13 +6,15 @@
    For moduli of 512 to 32768 bits: the round trip Z/N -> RNS -> Z/N, forward
    then inverse transforms at lengths below, at and above the in-block
    length, and products of random polynomials mod N (all coefficients for
-   small degrees, sampled ones for the longest transforms). */
+   small degrees, sampled ones for the longest transforms); all of it for
+   contexts made for any inputs below 2^(32 NL), then for inputs below 2N. */
 
 #include "../gpu_rns.cu"
 #include <gmp.h>
 
 static gmp_randstate_t rs;
 static int failures = 0;
+static int below_2n = 0;   /* contexts for inputs below 2N (gpu_rns_create) */
 
 static void
 fail (const char *what, int bits, const char *detail)
@@ -39,7 +41,13 @@ fill (std::vector<uint32_t> &h, mpz_vec &z, size_t C, int nl, const mpz_t N,
       mpz_init (x);
       switch ((c + style) % 7)
         {
-        case 0: mpz_set_ui (x, 0); mpz_setbit (x, 32 * (size_t) nl);
+        case 0: if (below_2n)
+                  {
+                    mpz_mul_2exp (x, N, 1);
+                    mpz_sub_ui (x, x, 2);                 /* 2N - 2 */
+                    break;
+                  }
+                mpz_set_ui (x, 0); mpz_setbit (x, 32 * (size_t) nl);
                 mpz_sub_ui (x, x, 1); break;              /* 2^(32nl) - 1 */
         case 1: mpz_sub_ui (x, N, 1); break;
         case 2: mpz_set_ui (x, c % 3); break;
@@ -67,9 +75,10 @@ test_size (int bits, int lg_want)
   mpz_urandomb (N, rs, bits);
   mpz_setbit (N, bits - 1);
   mpz_setbit (N, 0);
-  gpu_rns *R = gpu_rns_create (N, lg_want);
+  gpu_rns *R = gpu_rns_create (N, lg_want, below_2n);
   const int nl = gpu_rns_limbs (R), P = gpu_rns_primes (R), K = gpu_rns_lg (R);
-  printf ("%6d bits: %4d limbs, %4d primes, K = %d\n", bits, nl, P, K);
+  printf ("%6d bits: %4d limbs, %4d primes, K = %d%s\n", bits, nl, P, K,
+          below_2n ? " (inputs below 2N)" : "");
   fflush (stdout);
   char msg[256];
 
@@ -189,8 +198,9 @@ main (int argc, char **argv)
   gmp_randinit_default (rs);
   gmp_randseed_ui (rs, 2026);
   const int lg = argc > 1 ? atoi (argv[1]) : 16;
-  for (int bits : { 512, 1024, 2048, 4096, 8192, 16384, 32768 })
-    test_size (bits, lg);
+  for (below_2n = 0; below_2n < 2; below_2n++)
+    for (int bits : { 512, 1024, 2048, 4096, 8192, 16384, 32768 })
+      test_size (bits, lg);
   printf ("%s (%d failures)\n", failures ? "FAILED" : "ALL OK", failures);
   return failures != 0;
 }

@@ -56,12 +56,23 @@
 struct gpu_polyalg {
   gpu_rns *R;
   size_t n;
+  int B;                            /* polynomials side by side */
   int l, nl;
   const uint32_t *d_N;
   uint32_t *d_N2, *d_one;
-  uint32_t *t[PA_NTMP];             /* scratch, 2n numbers each */
+  uint32_t *t[PA_NTMP];             /* scratch, 2n B numbers each */
   const uint32_t *F;                /* from gpu_poly_prepare */
   uint32_t *Iprep, *Fprep, *invFprep;
+  uint32_t *Tprep;                  /* B P n words: an operand's transforms
+                                       (gpu_poly_inverse, gpu_poly_tpeval) */
+  /* product tree levels up to degree lowmax by lowmul (gpu_polyalg_lowmul) */
+  void (*lowmul) (void *, uint32_t *, const uint32_t *, size_t, size_t);
+  void *lowctx;
+  size_t lowmax;
+  /* transposed evaluation levels up to children of degree mpmax by lowmp */
+  void (*lowmp) (void *, uint32_t *, const uint32_t *, const uint32_t *,
+                 size_t, size_t);
+  size_t mpmax;
   std::vector<void *> dev;
 };
 
@@ -137,44 +148,98 @@ k_zn_lin (uint32_t *r, size_t rs, const uint32_t *a, size_t as,
     }
 }
 
-/* r[i] = a[seg - 1 - i], i < seg, for BATCH segments (r != a) */
+/* The same through shared memory, tiles of TT = blockDim numbers (with
+   2 TT (NL + 1) words), so that loads and stores are coalesced: a tile's
+   words are moved by consecutive threads, then each thread does one
+   number. */
 __global__ void
-k_zn_rev (uint32_t *r, size_t rs, const uint32_t *a, size_t as, size_t seg,
-          size_t batch, int nl)
+k_zn_lin_t (uint32_t *r, size_t rs, const uint32_t *a, size_t as,
+            const uint32_t *b, size_t bs, size_t count, size_t batch,
+            int mode, const uint32_t *N2, int nl)
 {
-  for (size_t x = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-       x < seg * batch; x += (size_t) gridDim.x * blockDim.x)
+  extern __shared__ uint32_t sm[];
+  const int TT = blockDim.x, st = nl + 1, tid = threadIdx.x;
+  uint32_t *ta = sm, *tb = sm + TT * st;
+  const size_t total = count * batch;
+  for (size_t x0 = (size_t) blockIdx.x * TT; x0 < total;
+       x0 += (size_t) gridDim.x * TT)
     {
-      const size_t j = x / seg, i = x % seg;
-      uint32_t *rr = r + (j * rs + i) * nl;
-      const uint32_t *aa = a + (j * as + seg - 1 - i) * nl;
-      for (int w = 0; w < nl; w++)
-        rr[w] = aa[w];
+      for (int k = tid; k < TT * nl; k += TT)
+        {
+          const int num = k / nl, w = k % nl;
+          const size_t x = x0 + num;
+          if (x < total)
+            {
+              const size_t j = x / count, e = x % count;
+              ta[num * st + w] = a[(j * as + e) * nl + w];
+              if (mode != ZN_NEG)
+                tb[num * st + w] = b[(j * bs + e) * nl + w];
+            }
+        }
+      __syncthreads ();
+      if (x0 + tid < total)
+        {
+          uint32_t *aa = ta + tid * st;
+          const uint32_t *bb = tb + tid * st;
+          if (mode == ZN_ADD)
+            {
+              uint64_t c = 0;
+              for (int w = 0; w < nl; w++)
+                {
+                  c += (uint64_t) aa[w] + bb[w];
+                  aa[w] = (uint32_t) c;
+                  c >>= 32;
+                }
+            }
+          else
+            {
+              int64_t c = 0;
+              for (int w = 0; w < nl; w++)
+                {
+                  c += mode == ZN_SUB ? (int64_t) aa[w] - bb[w] + N2[w]
+                                      : (int64_t) N2[w] - aa[w];
+                  aa[w] = (uint32_t) c;
+                  c >>= 32;
+                }
+            }
+          zn_below2n (aa, N2, nl, 2);
+        }
+      __syncthreads ();
+      for (int k = tid; k < TT * nl; k += TT)
+        {
+          const int num = k / nl, w = k % nl;
+          const size_t x = x0 + num;
+          if (x < total)
+            {
+              const size_t j = x / count, e = x % count;
+              r[(j * rs + e) * nl + w] = ta[num * st + w];
+            }
+        }
+      __syncthreads ();
     }
 }
 
-/* level of degree 2d: node j, coefficients d .. 2d-1 += A + B, the nodes
-   A, B of degree d below it (reduced below 2N) */
+/* r[i] = a[seg - 1 - i], i < seg, for BATCH segments (r != a), segment j
+   of A into segment j ^ SWAP of R; one thread per limb */
 __global__ void
-k_monic_fix (uint32_t *L2, const uint32_t *L, size_t d, size_t nodes,
-             const uint32_t *N2, int nl)
+k_zn_rev (uint32_t *r, size_t rs, const uint32_t *a, size_t as, size_t seg,
+          size_t batch, int nl, int swap)
 {
   for (size_t x = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-       x < d * nodes; x += (size_t) gridDim.x * blockDim.x)
+       x < seg * batch * nl; x += (size_t) gridDim.x * blockDim.x)
     {
-      const size_t j = x / d, i = x % d;
-      uint32_t *r = L2 + (j * 2 * d + d + i) * nl;
-      const uint32_t *a = L + (j * 2 * d + i) * nl;
-      const uint32_t *b = L + (j * 2 * d + d + i) * nl;
-      uint64_t c = 0;
-      for (int w = 0; w < nl; w++)
-        {
-          c += (uint64_t) r[w] + a[w] + b[w];
-          r[w] = (uint32_t) c;
-          c >>= 32;
-        }
-      zn_below2n (r, N2, nl, 2);
+      const size_t w = x % nl, e = x / nl, j = e / seg, i = e % seg;
+      r[((j ^ swap) * rs + i) * nl + w] = a[(j * as + seg - 1 - i) * nl + w];
     }
+}
+
+/* r[j RS] = x, j < BATCH */
+__global__ void
+k_zn_bcast (uint32_t *r, size_t rs, const uint32_t *x, size_t batch, int nl)
+{
+  for (size_t e = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+       e < batch * nl; e += (size_t) gridDim.x * blockDim.x)
+    r[(e / nl) * rs * nl + e % nl] = x[e % nl];
 }
 
 /* x <- x mod N for x < 16 N */
@@ -218,31 +283,56 @@ static void
 zn_lin (gpu_polyalg *A, uint32_t *r, size_t rs, const uint32_t *a, size_t as,
         const uint32_t *b, size_t bs, size_t count, size_t batch, int mode)
 {
-  k_zn_lin<<<blocks_for (count * batch), 256>>> (r, rs, a, as, b, bs, count,
-                                                 batch, mode, A->d_N2, A->nl);
+  gpu_rns_prof_begin ();
+  int tt = 128;
+  while (tt > 32 && (size_t) 2 * tt * (A->nl + 1) * 4 > 48 * 1024)
+    tt /= 2;
+  const size_t smem = (size_t) 2 * tt * (A->nl + 1) * 4;
+  if (smem <= 48 * 1024)
+    {
+      const size_t tiles = (count * batch + tt - 1) / tt;
+      k_zn_lin_t<<<(unsigned) std::min (tiles, (size_t) 65536), tt, smem>>> (
+          r, rs, a, as, b, bs, count, batch, mode, A->d_N2, A->nl);
+    }
+  else
+    k_zn_lin<<<blocks_for (count * batch), 256>>> (r, rs, a, as, b, bs, count,
+                                                   batch, mode, A->d_N2,
+                                                   A->nl);
   CUDA_CHECK (cudaGetLastError ());
+  gpu_rns_prof_end ();
 }
 
 static void
 zn_rev (gpu_polyalg *A, uint32_t *r, size_t rs, const uint32_t *a, size_t as,
-        size_t seg, size_t batch)
+        size_t seg, size_t batch, int swap = 0)
 {
-  k_zn_rev<<<blocks_for (seg * batch), 256>>> (r, rs, a, as, seg, batch,
-                                               A->nl);
+  gpu_rns_prof_begin ();
+  k_zn_rev<<<blocks_for (seg * batch * A->nl), 256>>> (r, rs, a, as, seg,
+                                                       batch, A->nl, swap);
   CUDA_CHECK (cudaGetLastError ());
+  gpu_rns_prof_end ();
 }
 
 static void
 zn_copy (gpu_polyalg *A, uint32_t *r, const uint32_t *a, size_t count)
 {
+  gpu_rns_prof_begin ();
   CUDA_CHECK (cudaMemcpy (r, a, count * A->nl * sizeof (uint32_t),
                           cudaMemcpyDeviceToDevice));
+  gpu_rns_prof_end ();
 }
 
 void
 gpu_zn_reduce (gpu_polyalg *A, uint32_t *x, size_t count)
 {
   k_zn_reduce<<<blocks_for (count), 256>>> (x, count, A->d_N, A->nl);
+  CUDA_CHECK (cudaGetLastError ());
+}
+
+static void
+zn_bcast (gpu_polyalg *A, uint32_t *r, size_t rs, const uint32_t *x)
+{
+  k_zn_bcast<<<blocks_for (A->B * A->nl), 256>>> (r, rs, x, A->B, A->nl);
   CUDA_CHECK (cudaGetLastError ());
 }
 
@@ -258,13 +348,14 @@ lg2 (size_t m)
 /* ---- context ---------------------------------------------------------- */
 
 gpu_polyalg *
-gpu_polyalg_create (gpu_rns *R, size_t n)
+gpu_polyalg_create (gpu_rns *R, size_t n, int B)
 {
   gpu_polyalg *A = new gpu_polyalg;
   A->R = R;
   A->n = n;
+  A->B = B;
   A->l = lg2 (n);
-  assert (((size_t) 1 << A->l) == n);
+  assert (((size_t) 1 << A->l) == n && B >= 1);
   A->nl = gpu_rns_limbs (R);
   A->d_N = gpu_rns_dev_N (R);
   const int nl = A->nl;
@@ -285,12 +376,42 @@ gpu_polyalg_create (gpu_rns *R, size_t n)
   A->dev.push_back (A->d_one);
   for (int i = 0; i < PA_NTMP; i++)
     {
-      CUDA_CHECK (cudaMalloc ((void **) &A->t[i], 2 * n * nl * 4));
+      CUDA_CHECK (cudaMalloc ((void **) &A->t[i], 2 * n * B * nl * 4));
       A->dev.push_back (A->t[i]);
     }
   A->F = NULL;
   A->Iprep = A->Fprep = A->invFprep = NULL;
+  CUDA_CHECK (cudaMalloc ((void **) &A->Tprep,
+                          (size_t) gpu_rns_primes (R) * n * B * 4));
+  A->dev.push_back (A->Tprep);
+  A->lowmul = NULL;
+  A->lowctx = NULL;
+  A->lowmax = 0;
+  A->lowmp = NULL;
+  A->mpmax = 0;
   return A;
+}
+
+void
+gpu_polyalg_lowmul (gpu_polyalg *A,
+                    void (*fn) (void *, uint32_t *, const uint32_t *, size_t,
+                                size_t),
+                    void *ctx, size_t dmax)
+{
+  A->lowmul = fn;
+  A->lowctx = ctx;
+  A->lowmax = fn != NULL ? dmax : 0;
+}
+
+void
+gpu_polyalg_lowmp (gpu_polyalg *A,
+                   void (*fn) (void *, uint32_t *, const uint32_t *,
+                               const uint32_t *, size_t, size_t),
+                   void *ctx, size_t hmax)
+{
+  A->lowmp = fn;
+  A->lowctx = ctx;
+  A->mpmax = fn != NULL ? hmax : 0;
 }
 
 void
@@ -303,23 +424,27 @@ gpu_polyalg_destroy (gpu_polyalg *A)
 
 /* ---- algorithms ------------------------------------------------------- */
 
+/* Every function works on the B polynomials side by side (polynomial b's n
+   numbers at b n); product trees are then B trees side by side, level by
+   level, since the nodes of a level never straddle two polynomials. */
+
 void
 gpu_poly_from_roots (gpu_polyalg *A, uint32_t *F, uint32_t **tree,
                      const uint32_t *roots)
 {
-  const size_t n = A->n;
+  const size_t n = A->n, nb = n * A->B;
   const int l = A->l, nl = A->nl;
   if (n == 1)
     {
-      zn_copy (A, F, roots, 1);
+      zn_copy (A, F, roots, nb);
       if (tree != NULL)
-        zn_copy (A, tree[0], roots, 1);
+        zn_copy (A, tree[0], roots, nb);
       return;
     }
   const uint32_t *cur = roots;
   if (tree != NULL)
     {
-      zn_copy (A, tree[l - 1], roots, n);
+      zn_copy (A, tree[l - 1], roots, nb);
       cur = tree[l - 1];
     }
   int ping = 0;
@@ -328,11 +453,15 @@ gpu_poly_from_roots (gpu_polyalg *A, uint32_t *F, uint32_t **tree,
       const int lgd = lg2 (2 * d);
       uint32_t *dst = 2 * d == n ? F
                       : tree != NULL ? tree[l - 1 - lgd] : A->t[ping ^= 1];
-      gpu_rns_conv (A->R, dst, 2 * d, 0, 2 * d, cur, 2 * d, d,
-                    cur + d * nl, 2 * d, d, NULL, lgd, (int) (n / (2 * d)));
-      k_monic_fix<<<blocks_for (n / 2), 256>>> (dst, cur, d, n / (2 * d),
-                                                A->d_N2, nl);
-      CUDA_CHECK (cudaGetLastError ());
+      if (d <= A->lowmax)
+        {
+          gpu_rns_prof_begin ();
+          A->lowmul (A->lowctx, dst, cur, nb, d);
+          gpu_rns_prof_end ();
+        }
+      else
+        gpu_rns_conv_monic (A->R, dst, 2 * d, cur, 2 * d, cur + d * nl,
+                            2 * d, d, (int) (nb / (2 * d)));
       cur = dst;
     }
 }
@@ -341,20 +470,23 @@ void
 gpu_poly_inverse (gpu_polyalg *A, uint32_t *I, const uint32_t *F)
 {
   const size_t n = A->n;
-  const int nl = A->nl;
+  const int nl = A->nl, B = A->B;
   uint32_t *revF = A->t[0], *E = A->t[1], *D = A->t[2];
-  zn_copy (A, revF, A->d_one, 1);
+  zn_bcast (A, revF, n, A->d_one);
   if (n > 1)
-    zn_rev (A, revF + nl, 0, F + nl, 0, n - 1, 1);   /* revF[t] = F[n - t] */
-  zn_copy (A, I, A->d_one, 1);
+    zn_rev (A, revF + nl, n, F + nl, n, n - 1, B);  /* revF[t] = F[n - t] */
+  zn_bcast (A, I, n, A->d_one);
   for (size_t k = 1; k < n; k *= 2)
     {
       const int lg = lg2 (2 * k);
+      /* I_k's transforms, for both products */
+      gpu_rns_prep (A->R, A->Tprep, I, n, k, lg, B);
       /* E = coefficients k .. 2k-1 of rev(F) I_k */
-      gpu_rns_conv (A->R, E, k, k, k, revF, 2 * k, 2 * k, I, k, k, NULL, lg, 1);
+      gpu_rns_conv_prep (A->R, E, k, k, k, revF, n, 2 * k, A->Tprep, 1, lg,
+                         B);
       /* I[k .. 2k-1] = -(I_k E mod x^k) */
-      gpu_rns_conv (A->R, D, k, 0, k, I, k, k, E, k, k, NULL, lg, 1);
-      zn_lin (A, I + k * nl, 0, D, 0, D, 0, k, 1, ZN_NEG);
+      gpu_rns_conv_prep (A->R, D, k, 0, k, E, k, k, A->Tprep, 1, lg, B);
+      zn_lin (A, I + k * nl, n, D, k, D, k, k, B, ZN_NEG);
     }
 }
 
@@ -362,9 +494,9 @@ void
 gpu_poly_prepare (gpu_polyalg *A, const uint32_t *F, const uint32_t *I)
 {
   const size_t n = A->n;
-  const int lg = A->l + 1, P = gpu_rns_primes (A->R);
+  const int lg = A->l + 1, P = gpu_rns_primes (A->R), B = A->B;
   assert (lg <= gpu_rns_lg (A->R));
-  const size_t words = (size_t) P << lg;
+  const size_t words = (size_t) B * P << lg;
   if (A->Iprep == NULL)
     {
       CUDA_CHECK (cudaMalloc ((void **) &A->Iprep, 3 * words * 4));
@@ -373,79 +505,111 @@ gpu_poly_prepare (gpu_polyalg *A, const uint32_t *F, const uint32_t *I)
       A->invFprep = A->Fprep + words;
     }
   A->F = F;
-  gpu_rns_prep (A->R, A->Iprep, I, n - 1 > 0 ? n - 1 : 1, lg);
-  gpu_rns_prep (A->R, A->Fprep, F, n, lg);
-  zn_rev (A, A->t[0], 0, I, 0, n, 1);             /* invF = rev (I) */
-  gpu_rns_prep (A->R, A->invFprep, A->t[0], n, lg);
+  gpu_rns_prep (A->R, A->Iprep, I, n, n - 1 > 0 ? n - 1 : 1, lg, B);
+  gpu_rns_prep (A->R, A->Fprep, F, n, n, lg, B);
+  zn_rev (A, A->t[0], n, I, n, n, B);             /* invF = rev (I) */
+  gpu_rns_prep (A->R, A->invFprep, A->t[0], n, n, lg, B);
 }
 
 void
 gpu_poly_reduce (gpu_polyalg *A, uint32_t *Rm, const uint32_t *A2)
 {
   const size_t n = A->n;
-  const int lg = A->l + 1, nl = A->nl;
+  const int lg = A->l + 1, nl = A->nl, B = A->B;
   uint32_t *ra = A->t[0], *rq = A->t[1], *Q = A->t[2], *QF = A->t[3];
   if (n == 1)
     {
-      /* A2 is a constant */
-      if (Rm != A2)
-        zn_copy (A, Rm, A2, 1);
+      /* each A2 is a constant */
+      zn_rev (A, Rm, 1, A2, 2, 1, B);
       return;
     }
-  zn_rev (A, ra, 0, A2 + n * nl, 0, n - 1, 1);    /* rev (high A) */
-  gpu_rns_conv (A->R, rq, 0, 0, n - 1, ra, 0, n - 1, NULL, 0, 0, A->Iprep,
-                lg, 1);
-  zn_rev (A, Q, 0, rq, 0, n - 1, 1);
-  gpu_rns_conv (A->R, QF, 0, 0, n, Q, 0, n - 1, NULL, 0, 0, A->Fprep, lg, 1);
-  zn_lin (A, Rm, 0, A2, 0, QF, 0, n, 1, ZN_SUB);
+  /* each A2 has 2n numbers (2n - 1 used), Rm n */
+  zn_rev (A, ra, n, A2 + n * nl, 2 * n, n - 1, B);   /* rev (high A) */
+  gpu_rns_conv (A->R, rq, n, 0, n - 1, ra, n, n - 1, NULL, 1, 0, A->Iprep,
+                lg, B);
+  zn_rev (A, Q, n, rq, n, n - 1, B);
+  gpu_rns_conv (A->R, QF, n, 0, n, Q, n, n - 1, NULL, 1, 0, A->Fprep, lg, B);
+  zn_lin (A, Rm, n, A2, 2 * n, QF, n, n, B, ZN_SUB);
 }
 
 void
 gpu_poly_mulmod (gpu_polyalg *A, uint32_t *H, const uint32_t *G, int first)
 {
   const size_t n = A->n;
+  const int B = A->B;
   if (first)
     {
-      zn_lin (A, H, 0, G, 0, A->F, 0, n, 1, ZN_SUB);
+      zn_lin (A, H, n, G, n, A->F, n, n, B, ZN_SUB);
       return;
     }
   uint32_t *Gp = A->t[4], *prod = A->t[5];
-  zn_lin (A, Gp, 0, G, 0, A->F, 0, n, 1, ZN_SUB);
-  gpu_rns_conv (A->R, prod, 0, 0, 2 * n - 1, Gp, 0, n, H, 0, n, NULL,
-                A->l + 1, 1);
+  zn_lin (A, Gp, n, G, n, A->F, n, n, B, ZN_SUB);
+  gpu_rns_conv (A->R, prod, 2 * n, 0, 2 * n - 1, Gp, n, n, H, n, n, NULL,
+                A->l + 1, B);
   gpu_poly_reduce (A, H, prod);
+}
+
+void
+gpu_poly_prodvals (gpu_polyalg *A, uint32_t *out, uint32_t *vals)
+{
+  const int nl = A->nl, B = A->B;
+  /* products of pairs, as cyclic convolutions of length 1, level by level
+     (a level's pairs never straddle two polynomials) */
+  size_t cnt = A->n;
+  uint32_t *cur = vals;
+  int ping = 0;
+  while (cnt > 1)
+    {
+      uint32_t *dst = cnt == 2 ? out : A->t[ping ^= 1];
+      gpu_rns_conv (A->R, dst, 1, 0, 1, cur, 2, 1, cur + nl, 2, 1, NULL, 0,
+                    (int) (B * cnt / 2));
+      cur = dst;
+      cnt /= 2;
+    }
+  if (A->n == 1)
+    zn_copy (A, out, vals, B);
 }
 
 void
 gpu_poly_tpeval (gpu_polyalg *A, uint32_t *vals, const uint32_t *H,
                  uint32_t *const *tree)
 {
-  const size_t n = A->n;
-  const int l = A->l, nl = A->nl;
+  const size_t n = A->n, nb = n * A->B;
+  const int l = A->l, nl = A->nl, B = A->B;
   uint32_t *U = A->t[0], *T = A->t[1], *revT = A->t[2], *T2 = A->t[3];
   if (n == 1)
     {
-      zn_copy (A, vals, H, 1);
+      zn_copy (A, vals, H, nb);
       return;
     }
   /* T = rev of the coefficients n-1 .. 2n-2 of invF H */
-  gpu_rns_conv (A->R, U, 0, n - 1, n, H, 0, n, NULL, 0, 0, A->invFprep,
-                l + 1, 1);
-  zn_rev (A, T, 0, U, 0, n, 1);
+  gpu_rns_conv (A->R, U, n, n - 1, n, H, n, n, NULL, 1, 0, A->invFprep,
+                l + 1, B);
+  zn_rev (A, T, n, U, n, n, B);
   for (int t = 0; t < l; t++)
     {
-      const size_t k = n >> t, half = k / 2, nodes = n / k;
+      const size_t k = n >> t, half = k / 2, nodes = nb / k;
       const int lgk = lg2 (k);
-      zn_rev (A, revT, half, tree[t], half, half, n / half);
-      /* left halves: MP (right child, b); right halves: MP (left child, b) */
-      gpu_rns_conv (A->R, T2, k, half - 1, half, revT + half * nl, k, half,
-                    T, k, k, NULL, lgk, (int) nodes);
-      gpu_rns_conv (A->R, T2 + half * nl, k, half - 1, half, revT, k, half,
-                    T, k, k, NULL, lgk, (int) nodes);
+      if (half <= A->mpmax)
+        {
+          gpu_rns_prof_begin ();
+          A->lowmp (A->lowctx, T2, T, tree[t], nb, half);
+          gpu_rns_prof_end ();
+          std::swap (T, T2);
+          continue;
+        }
+      /* the children reversed, each node's two swapped, so that item 2j
+         (j's right child) gives left half j and item 2j + 1 right half j:
+         left halves MP (right child, b), right halves MP (left child, b),
+         with b's transforms shared by the two */
+      zn_rev (A, revT, half, tree[t], half, half, nb / half, 1);
+      gpu_rns_prep (A->R, A->Tprep, T, k, k, lgk, (int) nodes);
+      gpu_rns_conv_prep (A->R, T2, half, half - 1, half, revT, half, half,
+                         A->Tprep, 2, lgk, (int) (2 * nodes));
       zn_lin (A, T2, k, T2, k, T + half * nl, k, half, nodes, ZN_ADD);
       zn_lin (A, T2 + half * nl, k, T2 + half * nl, k, T + half * nl, k, half,
               nodes, ZN_ADD);
       std::swap (T, T2);
     }
-  zn_copy (A, vals, T, n);
+  zn_copy (A, vals, T, nb);
 }

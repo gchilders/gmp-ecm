@@ -38,7 +38,8 @@
    (c dF + i) NL.
 
    The curve arithmetic uses the schoolbook products of gpu_mont.cuh, TPI
-   threads per curve (2 to 32) with L limbs each. */
+   threads per curve (2 to 32, or wide groups of 64 or 128) with L limbs
+   each, up to gpu_roots_max_bits (). */
 
 #ifndef _GPU_ROOTS_H
 #define _GPU_ROOTS_H 1
@@ -62,6 +63,11 @@ gpu_roots *gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
                              int nl, uint32_t curves, int verbose);
 void gpu_roots_destroy (gpu_roots *G);
 
+/* The CUDA stream (a cudaStream_t) for the roots (default 0); the calls
+   below return when their work on it is done, so another stream can run
+   meanwhile.  gpu_roots_tree and gpu_roots_mp stay on stream 0. */
+void gpu_roots_stream (gpu_roots *G, void *stream);
+
 /* Set up the curves: A[c] (Montgomery A, plain residue) and x[c] (the stage
    1 point), then the progressions of F and G.  Returns 0, or 1 with a
    factor of N in F and its curve in *CURVE (an inversion failed). */
@@ -72,5 +78,18 @@ int gpu_roots_curves (gpu_roots *G, mpz_t *A, mpz_t *x, mpz_t f, int *curve);
    in *CURVE (a root was the point at infinity mod a prime of N). */
 int gpu_roots_F (gpu_roots *G, uint32_t *out, mpz_t f, int *curve);
 int gpu_roots_G (gpu_roots *G, uint32_t *out, mpz_t f, int *curve);
+
+/* A level of product trees in Z/N for gpu_polyalg (gpu_polyalg_lowmul;
+   CTX is a gpu_roots of the same N and NL): IN holds COUNT / (2D) pairs of
+   monic nodes of degree D (their D low coefficients side by side), OUT gets
+   their products, monic of degree 2D. */
+void gpu_roots_tree (void *ctx, uint32_t *out, const uint32_t *in,
+                     size_t count, size_t d);
+
+/* A level of the transposed evaluation in Z/N for gpu_polyalg
+   (gpu_polyalg_lowmp): the COUNT values TV of nodes of 2 HALF values, with
+   the children's coefficients in TREE, into OUT (see gpu_poly_tpeval). */
+void gpu_roots_mp (void *ctx, uint32_t *out, const uint32_t *tv,
+                   const uint32_t *tree, size_t count, size_t half);
 
 #endif /* _GPU_ROOTS_H */

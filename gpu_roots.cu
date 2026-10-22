@@ -216,9 +216,9 @@ rt_identity (rt_pt<L> &p, const uint32_t * __restrict__ oneg, uint32_t off)
     }
 }
 
-template<int L>
+template<int L, class G>
 GM_DEV void
-rt_modulus (const gm_group &g, uint32_t (&N)[L], uint32_t (&N2)[L],
+rt_modulus (const G &g, uint32_t (&N)[L], uint32_t (&N2)[L],
             const uint32_t * __restrict__ Ng, uint32_t off)
 {
 #pragma unroll
@@ -230,9 +230,9 @@ rt_modulus (const gm_group &g, uint32_t (&N)[L], uint32_t (&N2)[L],
 /* r = p + q (unified: also for p = q, or either the identity), with the
    curve constants a, d of CST.  Inputs below 2N, outputs below 2N.  R may
    alias P and Q. */
-template<int L>
+template<int L, class G>
 GM_DEV void
-rt_add (const gm_group &g, rt_pt<L> &r, const rt_pt<L> &p,
+rt_add (const G &g, rt_pt<L> &r, const rt_pt<L> &p,
         const rt_pt<L> &q, const uint32_t * __restrict__ cst, uint32_t n,
         uint32_t off, const uint32_t (&N)[L], const uint32_t (&N2)[L],
         uint32_t np0)
@@ -279,9 +279,9 @@ enum { RS_CHAIN, RS_FILL, RS_SCALAR };
      digit).  Table point t of progression r of curve c is the interleaved
      point t (numbers 4t .. 4t+3) of thread column (c nr + r) TPI + lane, of
      TS columns. */
-template<int L>
-__global__ void
-rt_setup_kernel (uint32_t tpi, int mode, uint32_t count,
+template<int L, class G>
+__device__ __forceinline__ void
+rt_setup_body (const G &g, uint32_t tpi, int mode, uint32_t count,
                  const uint32_t * __restrict__ cst, uint32_t * __restrict__ W,
                  uint32_t K, uint32_t w, uint32_t nw, uint32_t k0,
                  uint32_t k1, uint32_t E, uint32_t nr, uint32_t S,
@@ -291,8 +291,6 @@ rt_setup_kernel (uint32_t tpi, int mode, uint32_t count,
                  const uint32_t * __restrict__ Ng,
                  const uint32_t * __restrict__ oneg, uint32_t np0)
 {
-  gm_group g;
-  g.init (tpi);
   const uint32_t inst = (blockIdx.x * blockDim.x + threadIdx.x) / g.tpi;
   const uint32_t n = g.tpi * L, off = g.lane * L;
   const bool live = inst < count;
@@ -390,6 +388,42 @@ rt_setup_kernel (uint32_t tpi, int mode, uint32_t count,
     }
 }
 
+template<int L>
+__global__ void
+rt_setup_kernel (uint32_t tpi, int mode, uint32_t count,
+                 const uint32_t * __restrict__ cst, uint32_t * __restrict__ W,
+                 uint32_t K, uint32_t w, uint32_t nw, uint32_t k0,
+                 uint32_t k1, uint32_t E, uint32_t nr, uint32_t S,
+                 const uint8_t * __restrict__ dig,
+                 const uint8_t * __restrict__ sgn,
+                 uint32_t * __restrict__ state, uint32_t Ts,
+                 const uint32_t * __restrict__ Ng,
+                 const uint32_t * __restrict__ oneg, uint32_t np0)
+{
+  gm_group g;
+  g.init (tpi);
+  rt_setup_body<L> (g, tpi, mode, count, cst, W, K, w, nw, k0, k1, E, nr, S, dig, sgn, state, Ts, Ng, oneg, np0);
+}
+
+/* the same with a wide group (64 or 128 threads per instance) */
+template<int L>
+__global__ void
+rt_setup_wkernel (uint32_t tpi, int mode, uint32_t count,
+                 const uint32_t * __restrict__ cst, uint32_t * __restrict__ W,
+                 uint32_t K, uint32_t w, uint32_t nw, uint32_t k0,
+                 uint32_t k1, uint32_t E, uint32_t nr, uint32_t S,
+                 const uint8_t * __restrict__ dig,
+                 const uint8_t * __restrict__ sgn,
+                 uint32_t * __restrict__ state, uint32_t Ts,
+                 const uint32_t * __restrict__ Ng,
+                 const uint32_t * __restrict__ oneg, uint32_t np0)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  rt_setup_body<L> (g, tpi, mode, count, cst, W, K, w, nw, k0, k1, E, nr, S, dig, sgn, state, Ts, Ng, oneg, np0);
+}
+
 /* Steps IT in [IT0, IT1) of all progressions (one instance per (curve c,
    progression r), C nr of them; the state is interleaved over this
    launch's threads).  Step IT emits the root of fd[0] (unless its slot is
@@ -398,9 +432,9 @@ rt_setup_kernel (uint32_t tpi, int mode, uint32_t count,
    G: the roots [BASE, BASE + dF); progression r has root numbers r + n nr,
    so its steps n in [nlo, nhi) are the ones in range, n = nlo + IT; the
    state of an instance with no more steps is not updated. */
-template<int L>
-__global__ void
-rt_step_kernel (uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
+template<int L, class G>
+__device__ __forceinline__ void
+rt_step_body (const G &g, uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
                 uint32_t * __restrict__ state,
                 const uint32_t * __restrict__ cst,
                 const int32_t * __restrict__ slots, uint64_t base,
@@ -408,8 +442,6 @@ rt_step_kernel (uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
                 uint32_t * __restrict__ num, uint32_t * __restrict__ den,
                 const uint32_t * __restrict__ Ng, uint32_t np0)
 {
-  gm_group g;
-  g.init (tpi);
   const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t T = gridDim.x * blockDim.x;
   const uint32_t inst = t / g.tpi;
@@ -476,22 +508,52 @@ rt_step_kernel (uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
     }
 }
 
+template<int L>
+__global__ void
+rt_step_kernel (uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
+                uint32_t * __restrict__ state,
+                const uint32_t * __restrict__ cst,
+                const int32_t * __restrict__ slots, uint64_t base,
+                uint32_t dF, uint32_t it0, uint32_t it1,
+                uint32_t * __restrict__ num, uint32_t * __restrict__ den,
+                const uint32_t * __restrict__ Ng, uint32_t np0)
+{
+  gm_group g;
+  g.init (tpi);
+  rt_step_body<L> (g, tpi, ninst, nr, S, state, cst, slots, base, dF, it0, it1, num, den, Ng, np0);
+}
+
+/* the same with a wide group (64 or 128 threads per instance) */
+template<int L>
+__global__ void
+rt_step_wkernel (uint32_t tpi, uint32_t ninst, uint32_t nr, uint32_t S,
+                uint32_t * __restrict__ state,
+                const uint32_t * __restrict__ cst,
+                const int32_t * __restrict__ slots, uint64_t base,
+                uint32_t dF, uint32_t it0, uint32_t it1,
+                uint32_t * __restrict__ num, uint32_t * __restrict__ den,
+                const uint32_t * __restrict__ Ng, uint32_t np0)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  rt_step_body<L> (g, tpi, ninst, nr, S, state, cst, slots, base, dF, it0, it1, num, den, Ng, np0);
+}
+
 /* Elementwise products over COUNT instances i (contiguous numbers):
    RV_UP:    OUT[i] = A[2i] A[2i+1] (A[2i] if 2i+1 = NA): a tree level up;
    RV_DOWN:  A holds the inverses of the parents of level B (NA numbers):
              B[2i], B[2i+1] <- A[i] B[2i+1], A[i] B[2i], their inverses;
    RV_FINAL: OUT[i] (NL limbs) = A[i] B[i] / R: numerator times inverse,
              out of Montgomery form. */
-template<int L>
-__global__ void
-rt_vec_kernel (uint32_t tpi, int mode, uint64_t count,
+template<int L, class G>
+__device__ __forceinline__ void
+rt_vec_body (const G &g, uint32_t tpi, int mode, uint64_t count,
                const uint32_t * __restrict__ a, uint64_t na,
                uint32_t * __restrict__ b, uint32_t * __restrict__ out,
                uint32_t nl, const uint32_t * __restrict__ Ng,
                const uint32_t * __restrict__ oneg, uint32_t np0)
 {
-  gm_group g;
-  g.init (tpi);
   const uint64_t inst = ((uint64_t) blockIdx.x * blockDim.x + threadIdx.x)
                         / g.tpi;
   const uint32_t n = g.tpi * L, off = g.lane * L;
@@ -547,6 +609,220 @@ rt_vec_kernel (uint32_t tpi, int mode, uint64_t count,
     }
 }
 
+template<int L>
+__global__ void
+rt_vec_kernel (uint32_t tpi, int mode, uint64_t count,
+               const uint32_t * __restrict__ a, uint64_t na,
+               uint32_t * __restrict__ b, uint32_t * __restrict__ out,
+               uint32_t nl, const uint32_t * __restrict__ Ng,
+               const uint32_t * __restrict__ oneg, uint32_t np0)
+{
+  gm_group g;
+  g.init (tpi);
+  rt_vec_body<L> (g, tpi, mode, count, a, na, b, out, nl, Ng, oneg, np0);
+}
+
+/* the same with a wide group (64 or 128 threads per instance) */
+template<int L>
+__global__ void
+rt_vec_wkernel (uint32_t tpi, int mode, uint64_t count,
+               const uint32_t * __restrict__ a, uint64_t na,
+               uint32_t * __restrict__ b, uint32_t * __restrict__ out,
+               uint32_t nl, const uint32_t * __restrict__ Ng,
+               const uint32_t * __restrict__ oneg, uint32_t np0)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  rt_vec_body<L> (g, tpi, mode, count, a, na, b, out, nl, Ng, oneg, np0);
+}
+
+/* number I (NL limbs, plain, below 2N) into this lane's L limbs */
+template<int L>
+GM_DEV void
+rt_nload (uint32_t (&x)[L], const uint32_t * __restrict__ buf, size_t i,
+          uint32_t nl, uint32_t off)
+{
+#pragma unroll
+  for (int k = 0; k < L; k++)
+    x[k] = off + k < nl ? buf[i * nl + off + k] : 0;
+}
+
+/* One level of a product tree in Z/N (plain numbers of NL limbs below 2N):
+   the nodes x^d + A, x^d + B of IN (D numbers each, node pairs side by
+   side) give x^2d + C, C the 2D numbers at the same place in OUT:
+     C_k = sum_(i + j = k) a_i b_j + (a_(k-d) + b_(k-d) if k >= d).
+   One instance per output number (COUNT of them); every instance runs all
+   D products i (with b_j = 0 out of range: a warp's lanes must run the
+   same products).  The sum is of Montgomery products a_i b_j / R, so it is
+   multiplied by R^2 / R at the end (R2G: R^2 mod N). */
+template<int L, class G>
+__device__ __forceinline__ void
+rt_tree_body (const G &g, uint32_t tpi, uint64_t count, uint32_t d,
+                const uint32_t * __restrict__ in, uint32_t * __restrict__ out,
+                uint32_t nl, const uint32_t * __restrict__ Ng,
+                const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  const uint64_t inst = ((uint64_t) blockIdx.x * blockDim.x + threadIdx.x)
+                        / g.tpi;
+  const uint32_t off = g.lane * L;
+  const bool live = inst < count;
+  const uint64_t o = live ? inst : count - 1;
+  uint32_t N[L], N2[L];
+  rt_modulus<L> (g, N, N2, Ng, off);
+  const uint64_t pair = o / (2 * d);
+  const int64_t k = (int64_t) (o % (2 * d));
+  const uint32_t *A = in + pair * 2 * d * nl, *Bp = A + (size_t) d * nl;
+
+  uint32_t acc[L], x[L], y[L];
+#pragma unroll
+  for (int t = 0; t < L; t++)
+    acc[t] = 0;
+  for (uint32_t i = 0; i < d; i++)
+    {
+      const int64_t j = k - i;
+      rt_nload<L> (x, A, i, nl, off);
+      if (j >= 0 && j < d)
+        rt_nload<L> (y, Bp, (size_t) j, nl, off);
+      else
+#pragma unroll
+        for (int t = 0; t < L; t++)
+          y[t] = 0;
+      gm_mul<L, false> (g, x, x, y, N, np0);
+      gm_add<L, false> (g, acc, acc, x);
+      gm_sub<L, false> (g, acc, acc, N2, N2);     /* below 2N */
+    }
+#pragma unroll
+  for (int t = 0; t < L; t++)
+    y[t] = R2g[off + t];
+  gm_mul<L, false> (g, acc, acc, y, N, np0);
+  /* + a_(k-d) + b_(k-d) */
+  if (k >= d)
+    {
+      rt_nload<L> (x, A, (size_t) (k - d), nl, off);
+      rt_nload<L> (y, Bp, (size_t) (k - d), nl, off);
+    }
+  else
+#pragma unroll
+    for (int t = 0; t < L; t++)
+      x[t] = y[t] = 0;
+  gm_add<L, false> (g, acc, acc, x);
+  gm_sub<L, false> (g, acc, acc, N2, N2);
+  gm_add<L, false> (g, acc, acc, y);
+  gm_sub<L, false> (g, acc, acc, N2, N2);
+  if (live)
+#pragma unroll
+    for (int t = 0; t < L; t++)
+      if (off + t < nl)
+        out[o * nl + off + t] = acc[t];
+}
+
+template<int L>
+__global__ void
+rt_tree_kernel (uint32_t tpi, uint64_t count, uint32_t d,
+                const uint32_t * __restrict__ in, uint32_t * __restrict__ out,
+                uint32_t nl, const uint32_t * __restrict__ Ng,
+                const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  gm_group g;
+  g.init (tpi);
+  rt_tree_body<L> (g, tpi, count, d, in, out, nl, Ng, R2g, np0);
+}
+
+/* the same with a wide group (64 or 128 threads per instance) */
+template<int L>
+__global__ void
+rt_tree_wkernel (uint32_t tpi, uint64_t count, uint32_t d,
+                const uint32_t * __restrict__ in, uint32_t * __restrict__ out,
+                uint32_t nl, const uint32_t * __restrict__ Ng,
+                const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  rt_tree_body<L> (g, tpi, count, d, in, out, nl, Ng, R2g, np0);
+}
+
+/* One level of the transposed evaluation in Z/N (see gpu_poly_tpeval): for
+   each node (K = 2 HALF values of TV, its children L, R of degree HALF in
+   TREE at the same place), the new values are
+     out[i]        = sum_j R_j TV[i + j] + TV[HALF + i],
+     out[HALF + i] = sum_j L_j TV[i + j] + TV[HALF + i],   i, j < HALF.
+   One instance per output number (COUNT); all run HALF products. */
+template<int L, class G>
+__device__ __forceinline__ void
+rt_mp_body (const G &g, uint32_t tpi, uint64_t count, uint32_t half,
+              const uint32_t * __restrict__ tv,
+              const uint32_t * __restrict__ tree, uint32_t * __restrict__ out,
+              uint32_t nl, const uint32_t * __restrict__ Ng,
+              const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  const uint64_t inst = ((uint64_t) blockIdx.x * blockDim.x + threadIdx.x)
+                        / g.tpi;
+  const uint32_t off = g.lane * L;
+  const bool live = inst < count;
+  const uint64_t o = live ? inst : count - 1;
+  uint32_t N[L], N2[L];
+  rt_modulus<L> (g, N, N2, Ng, off);
+  const uint64_t k = 2 * (uint64_t) half, node = o / k;
+  const uint32_t r = (uint32_t) (o % k), i = r % half;
+  const uint32_t *T = tv + node * k * nl;
+  const uint32_t *child = tree + (node * k + (r < half ? half : 0)) * nl;
+
+  uint32_t acc[L], x[L], y[L];
+#pragma unroll
+  for (int t = 0; t < L; t++)
+    acc[t] = 0;
+  for (uint32_t j = 0; j < half; j++)
+    {
+      rt_nload<L> (x, child, j, nl, off);
+      rt_nload<L> (y, T, i + j, nl, off);
+      gm_mul<L, false> (g, x, x, y, N, np0);
+      gm_add<L, false> (g, acc, acc, x);
+      gm_sub<L, false> (g, acc, acc, N2, N2);
+    }
+#pragma unroll
+  for (int t = 0; t < L; t++)
+    y[t] = R2g[off + t];
+  gm_mul<L, false> (g, acc, acc, y, N, np0);
+  rt_nload<L> (x, T, half + i, nl, off);
+  gm_add<L, false> (g, acc, acc, x);
+  gm_sub<L, false> (g, acc, acc, N2, N2);
+  if (live)
+#pragma unroll
+    for (int t = 0; t < L; t++)
+      if (off + t < nl)
+        out[o * nl + off + t] = acc[t];
+}
+
+template<int L>
+__global__ void
+rt_mp_kernel (uint32_t tpi, uint64_t count, uint32_t half,
+              const uint32_t * __restrict__ tv,
+              const uint32_t * __restrict__ tree, uint32_t * __restrict__ out,
+              uint32_t nl, const uint32_t * __restrict__ Ng,
+              const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  gm_group g;
+  g.init (tpi);
+  rt_mp_body<L> (g, tpi, count, half, tv, tree, out, nl, Ng, R2g, np0);
+}
+
+/* the same with a wide group (64 or 128 threads per instance) */
+template<int L>
+__global__ void
+rt_mp_wkernel (uint32_t tpi, uint64_t count, uint32_t half,
+              const uint32_t * __restrict__ tv,
+              const uint32_t * __restrict__ tree, uint32_t * __restrict__ out,
+              uint32_t nl, const uint32_t * __restrict__ Ng,
+              const uint32_t * __restrict__ R2g, uint32_t np0)
+{
+  __shared__ uint32_t smem[GM_WSHARED_WORDS (GPU_TPB, L)];
+  gm_wgroup g;
+  g.init (tpi, smem, L);
+  rt_mp_body<L> (g, tpi, count, half, tv, tree, out, nl, Ng, R2g, np0);
+}
+
 /* ---- kernel table ------------------------------------------------------ */
 
 typedef void (*rt_setup_fn) (uint32_t, int, uint32_t, const uint32_t *,
@@ -563,27 +839,64 @@ typedef void (*rt_step_fn) (uint32_t, uint32_t, uint32_t, uint32_t,
 typedef void (*rt_vec_fn) (uint32_t, int, uint64_t, const uint32_t *,
                            uint64_t, uint32_t *, uint32_t *, uint32_t,
                            const uint32_t *, const uint32_t *, uint32_t);
+typedef void (*rt_tree_fn) (uint32_t, uint64_t, uint32_t, const uint32_t *,
+                            uint32_t *, uint32_t, const uint32_t *,
+                            const uint32_t *, uint32_t);
+typedef void (*rt_mp_fn) (uint32_t, uint64_t, uint32_t, const uint32_t *,
+                          const uint32_t *, uint32_t *, uint32_t,
+                          const uint32_t *, const uint32_t *, uint32_t);
 
-struct rt_kernels {
+/* one shape's kernels, for groups of TPI <= 32 or for wide groups */
+struct rt_kset {
   rt_setup_fn setup;
   rt_step_fn step;
   rt_vec_fn vec;
+  rt_tree_fn tree;
+  rt_mp_fn mp;
+};
+
+struct rt_kernels {
+  rt_kset n, w;       /* narrow (TPI 2 to 32), wide (TPI 64, 128) */
 };
 
 /* The limbs per thread with kernels (few, as each shape takes a while to
-   compile); the shape for n limbs is the fewest threads per curve, 2 to 32,
-   with L <= 8, else 32 threads; L the next one in this list. */
-static const uint32_t rt_Ls[] = { 1, 2, 3, 4, 5, 6, 8, 12, 16, 24 };
+   compile; wide groups only for L >= 6; L = 17 so that N just past 2^16
+   bits, 2049 limbs, gets 128 x 17 rather than 128 x 24).
+   The shape for n limbs is the one with the fewest limbs TPI L >= n
+   (products cost about (TPI L)^2), then the fewest threads per curve (fewer
+   shuffles or barriers), within a register budget: L <= 12 for the roots
+   (at 1024 bits 2 x 17 needs 255 registers and spills in the step kernel,
+   1.6 times slower than 4 x 9 on an A10), L <= 17 for the Z/N tree and
+   middle product kernels (2 x 17 there is faster than 4 x 9).  Past the
+   budget (N above 32 x 12 or 128 x 12 limbs), any L. */
+static const uint32_t rt_Ls[] = { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 24 };
 
-template<int L>
+/* ZN: only the Z/N kernels (tree and mp) */
+template<int L, bool ZN = false>
 static void
 rt_put (rt_kernels *t)
 {
   if constexpr (L <= GPU_ROOTS_MAX_L)
     {
-      t[L].setup = rt_setup_kernel<L>;
-      t[L].step = rt_step_kernel<L>;
-      t[L].vec = rt_vec_kernel<L>;
+      t[L].n.tree = rt_tree_kernel<L>;
+      t[L].n.mp = rt_mp_kernel<L>;
+      if constexpr (!ZN)
+        {
+          t[L].n.setup = rt_setup_kernel<L>;
+          t[L].n.step = rt_step_kernel<L>;
+          t[L].n.vec = rt_vec_kernel<L>;
+        }
+      if constexpr (L >= 6)
+        {
+          t[L].w.tree = rt_tree_wkernel<L>;
+          t[L].w.mp = rt_mp_wkernel<L>;
+          if constexpr (!ZN)
+            {
+              t[L].w.setup = rt_setup_wkernel<L>;
+              t[L].w.step = rt_step_wkernel<L>;
+              t[L].w.vec = rt_vec_wkernel<L>;
+            }
+        }
     }
 }
 
@@ -602,29 +915,94 @@ rt_get_kernels (uint32_t L)
       rt_put<5> (t);
       rt_put<6> (t);
       rt_put<8> (t);
+      rt_put<9> (t);
       rt_put<12> (t);
       rt_put<16> (t);
+      rt_put<17> (t);
       rt_put<24> (t);
       init = true;
     }
-  return L >= 1 && L <= 24 && t[L].setup != NULL ? &t[L] : NULL;
+  return L >= 1 && L <= 24 && t[L].n.tree != NULL ? &t[L] : NULL;
+}
+
+/* the kernels for TPI threads of L limbs, or NULL; ZN: the Z/N ones */
+static const rt_kset *
+rt_kset_for (uint32_t tpi, uint32_t L, bool zn)
+{
+  const rt_kernels *k = rt_get_kernels (L);
+  if (k == NULL || tpi < 2 || tpi > 128 || (tpi & (tpi - 1)) != 0)
+    return NULL;
+  const rt_kset *ks = tpi > 32 ? &k->w : &k->n;
+  return (zn ? ks->tree != NULL : ks->setup != NULL) ? ks : NULL;
 }
 
 static bool
-rt_shape (uint32_t nlimbs, uint32_t *tpi, uint32_t *L)
+rt_shape (uint32_t nlimbs, uint32_t *tpi, uint32_t *L, bool zn = false)
 {
-  for (uint32_t t = 2; t <= 32; t *= 2)
-    for (uint32_t l : rt_Ls)
-      if (l * t >= nlimbs && (l <= 8 || t == 32) && rt_get_kernels (l))
-        {
-          *tpi = t;
-          *L = l;
-          return true;
-        }
+  const uint32_t lmax = zn ? 17 : 12;
+  for (int pass = 0; pass < 2; pass++)
+    {
+      uint32_t best = 0;
+      for (uint32_t t = 2; t <= 128; t *= 2)
+        for (uint32_t l : rt_Ls)
+          if (l * t >= nlimbs && (pass == 1 || l <= lmax)
+              && rt_kset_for (t, l, zn) != NULL
+              && (best == 0 || l * t < best))
+            {
+              best = l * t;
+              *tpi = t;
+              *L = l;
+            }
+      if (best != 0)
+        return true;
+    }
   return false;
 }
 
 /* ---- host side --------------------------------------------------------- */
+
+/* GMPECM_ROOTS_PROF set: time each kind of launch (synchronising),
+   printed by gpu_roots_destroy */
+enum { RP_CHAIN, RP_FILL, RP_SCALAR, RP_STEP, RP_UP, RP_DOWN, RP_FINAL,
+       RP_HOST, RP_N };
+static const char *rp_name[RP_N] = { "chain", "fill", "scalar", "step",
+                                     "inverse up", "inverse down", "final",
+                                     "host" };
+static struct {
+  int on = -1;
+  double ms[RP_N] = { 0 };
+  long calls[RP_N] = { 0 };
+  cudaEvent_t a, b;
+} rtp;
+
+static void
+rtp_begin (cudaStream_t st)
+{
+  if (rtp.on < 0)
+    {
+      rtp.on = getenv ("GMPECM_ROOTS_PROF") != NULL;
+      if (rtp.on)
+        {
+          cudaEventCreate (&rtp.a);
+          cudaEventCreate (&rtp.b);
+        }
+    }
+  if (rtp.on)
+    cudaEventRecord (rtp.a, st);
+}
+
+static void
+rtp_end (cudaStream_t st, int cat)
+{
+  if (!rtp.on)
+    return;
+  float ms;
+  cudaEventRecord (rtp.b, st);
+  cudaEventSynchronize (rtp.b);
+  cudaEventElapsedTime (&ms, rtp.a, rtp.b);
+  rtp.ms[cat] += ms;
+  rtp.calls[cat]++;
+}
 
 struct rt_z {
   mpz_t z;
@@ -655,12 +1033,18 @@ struct gpu_roots {
   size_t dF;
   unsigned long blocks;
   int S, dickson_a, verbose;
-  const rt_kernels *k;
+  const rt_kset *k;
   uint32_t K, w, nw;      /* digits of the coefficients, window */
-  uint32_t *d_N, *d_one, *d_cst, *d_W;
+  uint32_t *d_N, *d_one, *d_R2, *d_cst, *d_W;
+  /* the Z/N kernels' own shape: ZTPI threads of ZL limbs, ZN limbs, N and
+     R^2 mod N (R = 2^(32 ZN)) on ZN limbs */
+  const rt_kset *zk;
+  uint32_t ztpi, zL, zn;
+  uint32_t *d_zN, *d_zR2;
   uint32_t *d_num, *d_den, *d_tree;
   rt_set F, G;
   uint64_t gblock;        /* the next block of G */
+  cudaStream_t stream;    /* for everything but gpu_roots_tree, _mp */
 };
 
 static unsigned long
@@ -771,9 +1155,13 @@ rt_blocks (const gpu_roots *G, uint64_t count)
   return (uint32_t) (rt_padded (G, count) * G->tpi / GPU_TPB);
 }
 
-/* progressions per curve wanted for ROOTS roots: enough instances to fill
-   the GPU, but at most ROOTS / (4 K) so that the setup (S K additions per
-   progression) stays small next to the steps (S per root) */
+/* Progressions per curve wanted for ROOTS roots.  The steps run at the
+   arithmetic ceiling of the shape only with enough threads (fewer and they
+   are latency-bound; more cost setup: about 256 per SM was best on an A10
+   at 1024 bits), so: enough
+   instances for that, but at most ROOTS / K, so that the setup (S K
+   additions per progression, K digits) stays below the steps (S per
+   root).  GMPECM_ROOTS_NR sets it, GMPECM_ROOTS_FILL the threads per SM. */
 static uint32_t
 rt_nr_target (const gpu_roots *G, double roots, double kbits)
 {
@@ -784,8 +1172,10 @@ rt_nr_target (const gpu_roots *G, double roots, double kbits)
   CUDA_CHECK (cudaGetDevice (&dev));
   CUDA_CHECK (cudaDeviceGetAttribute (&sm, cudaDevAttrMultiProcessorCount,
                                       dev));
-  double fill = 4.0 * sm * 1024 / ((double) G->tpi * G->C);
-  double bal = roots / (4.0 * std::max (1.0, kbits / 4));
+  env = getenv ("GMPECM_ROOTS_FILL");
+  const double per_sm = env != NULL && atoi (env) > 0 ? atoi (env) : 256;
+  double fill = sm * per_sm / ((double) G->tpi * G->C);
+  double bal = roots / std::max (1.0, kbits / 4);
   double nr = std::min (fill, bal);
   return nr < 1 ? 1 : (uint32_t) std::min (nr, 65536.0);
 }
@@ -793,11 +1183,13 @@ rt_nr_target (const gpu_roots *G, double roots, double kbits)
 size_t
 gpu_roots_max_bits (void)
 {
-  uint32_t lmax = 0;
-  for (uint32_t l : rt_Ls)
-    if (rt_get_kernels (l))
-      lmax = l;
-  return 32 * 32 * (size_t) lmax - GPU_SPARE_BITS;
+  /* the largest TPI L with both the roots' and the Z/N kernels */
+  size_t nmax = 0;
+  for (uint32_t t = 2; t <= 128; t *= 2)
+    for (uint32_t l : rt_Ls)
+      if (rt_kset_for (t, l, false) != NULL && rt_kset_for (t, l, true) != NULL)
+        nmax = std::max (nmax, (size_t) t * l);
+  return 32 * nmax - GPU_SPARE_BITS;
 }
 
 static void
@@ -943,10 +1335,12 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
                   int verbose)
 {
   const uint32_t need = (mpz_sizeinbase (N, 2) + GPU_SPARE_BITS + 31) / 32;
+  if (tpi == 0 && getenv ("GMPECM_ROOTS_SHAPE") != NULL)
+    sscanf (getenv ("GMPECM_ROOTS_SHAPE"), "%u,%u", &tpi, &L);
   if (tpi == 0 && !rt_shape (need, &tpi, &L))
     return NULL;
-  const rt_kernels *k = rt_get_kernels (L);
-  if (k == NULL || tpi < 2 || tpi > 32 || (tpi & (tpi - 1)) != 0
+  const rt_kset *k = rt_kset_for (tpi, L, false);
+  if (k == NULL
       || tpi * L < need || S == 0 || dF == 0 || curves == 0 || d2 == 0
       || rt_gcd (d1, d2) != 1)
     return NULL;
@@ -965,6 +1359,7 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
   G->dickson_a = S < 0 ? -1 : 0;
   G->verbose = verbose;
   G->gblock = 0;
+  G->stream = 0;
   mpz_inits (G->N, G->R, G->R2, NULL);
   mpz_set (G->N, N);
   mpz_setbit (G->R, 32 * (size_t) G->n);
@@ -978,6 +1373,31 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
   G->d_N = rt_upload (h);
   gpu_to_limbs (h.data (), G->n, G->R);
   G->d_one = rt_upload (h);
+  gpu_to_limbs (h.data (), G->n, G->R2);
+  G->d_R2 = rt_upload (h);
+  {
+    uint32_t zt = tpi, zl = L;
+    const char *zs = getenv ("GMPECM_ROOTS_ZSHAPE");   /* development */
+    if (zs == NULL || sscanf (zs, "%u,%u", &zt, &zl) != 2
+        || rt_kset_for (zt, zl, true) == NULL || zt * zl < need)
+      rt_shape (need, &zt, &zl, true);
+    G->zk = rt_kset_for (zt, zl, true);
+    G->ztpi = zt;
+    G->zL = zl;
+    G->zn = zt * zl;
+    std::vector<uint32_t> hz (G->zn);
+    gpu_to_limbs (hz.data (), G->zn, N);
+    G->d_zN = rt_upload (hz);
+    mpz_t r;
+    mpz_init (r);
+    mpz_setbit (r, 32 * (size_t) G->zn);
+    mpz_mod (r, r, N);
+    mpz_mul (r, r, r);
+    mpz_mod (r, r, N);
+    gpu_to_limbs (hz.data (), G->zn, r);
+    G->d_zR2 = rt_upload (hz);
+    mpz_clear (r);
+  }
 
   rt_plan_F (G, d1, d2);
   rt_plan_G (G, d1, d2, i0);
@@ -1034,14 +1454,31 @@ rt_set_free (rt_set &s)
 }
 
 void
+gpu_roots_stream (gpu_roots *G, void *stream)
+{
+  G->stream = (cudaStream_t) stream;
+}
+
+void
 gpu_roots_destroy (gpu_roots *G)
 {
   if (G == NULL)
     return;
+  if (rtp.on > 0)
+    {
+      printf ("GPU roots kernels:");
+      for (int i = 0; i < RP_N; i++)
+        if (rtp.calls[i])
+          printf (" %s %.1f ms (%ld)", rp_name[i], rtp.ms[i], rtp.calls[i]);
+      printf ("\n");
+    }
   rt_set_free (G->F);
   rt_set_free (G->G);
   CUDA_CHECK (cudaFree (G->d_N));
   CUDA_CHECK (cudaFree (G->d_one));
+  CUDA_CHECK (cudaFree (G->d_R2));
+  CUDA_CHECK (cudaFree (G->d_zN));
+  CUDA_CHECK (cudaFree (G->d_zR2));
   CUDA_CHECK (cudaFree (G->d_cst));
   CUDA_CHECK (cudaFree (G->d_W));
   CUDA_CHECK (cudaFree (G->d_num));
@@ -1060,12 +1497,14 @@ rt_start_set (gpu_roots *G, rt_set &s)
   for (uint32_t k0 = 0; k0 < G->K; k0 += RT_SLICE)
     {
       uint32_t k1 = std::min (G->K, k0 + RT_SLICE);
-      G->k->setup<<<rt_blocks (G, count), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->setup<<<rt_blocks (G, count), GPU_TPB, 0, G->stream>>> (
           G->tpi, RS_SCALAR, (uint32_t) count, G->d_cst, G->d_W, G->K, G->w,
           G->nw, k0, k1, s.E, s.nr, G->S, s.d_dig, s.d_sgn, s.d_state, Ts,
           G->d_N,
           G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_SCALAR);
     }
 }
 
@@ -1124,27 +1563,31 @@ gpu_roots_curves (gpu_roots *G, mpz_t *A, mpz_t *x, mpz_t f, int *curve)
   if (found)
     return 1;
 
-  CUDA_CHECK (cudaMemcpy (G->d_cst, h.data (), h.size () * 4,
-                          cudaMemcpyHostToDevice));
+  CUDA_CHECK (cudaMemcpyAsync (G->d_cst, h.data (), h.size () * 4,
+                               cudaMemcpyHostToDevice, G->stream));
   for (uint32_t k0 = 0; k0 < G->K; k0 += RT_SLICE)
     {
       uint32_t k1 = std::min (G->K, k0 + RT_SLICE);
-      G->k->setup<<<rt_blocks (G, G->C), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->setup<<<rt_blocks (G, G->C), GPU_TPB, 0, G->stream>>> (
           G->tpi, RS_CHAIN, G->C, G->d_cst, G->d_W, G->K, G->w, G->nw, k0,
           k1, 0, 0, 0, NULL, NULL, NULL, 0, G->d_N, G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_CHAIN);
     }
   if (G->nw > 1)
     {
-      G->k->setup<<<rt_blocks (G, (uint64_t) G->C * G->K), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->setup<<<rt_blocks (G, (uint64_t) G->C * G->K), GPU_TPB, 0, G->stream>>> (
           G->tpi, RS_FILL, G->C * G->K, G->d_cst, G->d_W, G->K, G->w, G->nw,
           0, 0, 0, 0, 0, NULL, NULL, NULL, 0, G->d_N, G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_FILL);
     }
   rt_start_set (G, G->F);
   rt_start_set (G, G->G);
   G->gblock = 0;
-  CUDA_CHECK (cudaDeviceSynchronize ());
+  CUDA_CHECK (cudaStreamSynchronize (G->stream));
   return 0;
 }
 
@@ -1162,18 +1605,21 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
   while (cnt.back () > 1)
     {
       uint64_t c = (cnt.back () + 1) / 2;
-      G->k->vec<<<rt_blocks (G, c), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->vec<<<rt_blocks (G, c), GPU_TPB, 0, G->stream>>> (
           G->tpi, RV_UP, c, lev.back (), cnt.back (), NULL, p, 0, G->d_N,
           G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_UP);
       lev.push_back (p);
       cnt.push_back (c);
       p += c * n;
     }
 
   std::vector<uint32_t> h (n);
-  CUDA_CHECK (cudaMemcpy (h.data (), lev.back (), n * 4,
-                          cudaMemcpyDeviceToHost));
+  CUDA_CHECK (cudaMemcpyAsync (h.data (), lev.back (), n * 4,
+                               cudaMemcpyDeviceToHost, G->stream));
+  CUDA_CHECK (cudaStreamSynchronize (G->stream));
   mpz_t v, t;
   mpz_inits (v, t, NULL);
   gpu_from_limbs (v, h.data (), n);
@@ -1185,8 +1631,9 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
       mpz_gcd (f, v, G->N);
       *curve = -1;
       std::vector<uint32_t> all ((size_t) M * n);
-      CUDA_CHECK (cudaMemcpy (all.data (), G->d_den, all.size () * 4,
-                              cudaMemcpyDeviceToHost));
+      CUDA_CHECK (cudaMemcpyAsync (all.data (), G->d_den, all.size () * 4,
+                                   cudaMemcpyDeviceToHost, G->stream));
+      CUDA_CHECK (cudaStreamSynchronize (G->stream));
       for (uint32_t c = 0; c < G->C && *curve < 0; c++)
         {
           mpz_set_ui (v, 1);
@@ -1210,23 +1657,51 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
       mpz_mul (t, t, G->R2);
       mpz_mod (t, t, G->N);
       gpu_to_limbs (h.data (), n, t);
-      CUDA_CHECK (cudaMemcpy (lev.back (), h.data (), n * 4,
-                              cudaMemcpyHostToDevice));
+      CUDA_CHECK (cudaMemcpyAsync (lev.back (), h.data (), n * 4,
+                                   cudaMemcpyHostToDevice, G->stream));
       for (size_t l = lev.size () - 1; l > 0; l--)
         {
-          G->k->vec<<<rt_blocks (G, cnt[l]), GPU_TPB>>> (
+          rtp_begin (G->stream);
+          G->k->vec<<<rt_blocks (G, cnt[l]), GPU_TPB, 0, G->stream>>> (
               G->tpi, RV_DOWN, cnt[l], lev[l], cnt[l - 1], lev[l - 1], NULL,
               0, G->d_N, G->d_one, G->np0);
           CUDA_CHECK (cudaGetLastError ());
+          rtp_end (G->stream, RP_DOWN);
         }
-      G->k->vec<<<rt_blocks (G, M), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->vec<<<rt_blocks (G, M), GPU_TPB, 0, G->stream>>> (
           G->tpi, RV_FINAL, M, G->d_num, M, G->d_den, out, G->nl, G->d_N,
           G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
-      CUDA_CHECK (cudaDeviceSynchronize ());
+      rtp_end (G->stream, RP_FINAL);
+      CUDA_CHECK (cudaStreamSynchronize (G->stream));
     }
   mpz_clears (v, t, NULL);
   return found;
+}
+
+void
+gpu_roots_tree (void *ctx, uint32_t *out, const uint32_t *in, size_t count,
+                size_t d)
+{
+  gpu_roots *G = (gpu_roots *) ctx;
+  const uint64_t per = GPU_TPB / G->ztpi;
+  G->zk->tree<<<(unsigned) ((count + per - 1) / per), GPU_TPB>>> (
+      G->ztpi, count, (uint32_t) d, in, out, G->nl, G->d_zN, G->d_zR2,
+      G->np0);
+  CUDA_CHECK (cudaGetLastError ());
+}
+
+void
+gpu_roots_mp (void *ctx, uint32_t *out, const uint32_t *tv,
+              const uint32_t *tree, size_t count, size_t half)
+{
+  gpu_roots *G = (gpu_roots *) ctx;
+  const uint64_t per = GPU_TPB / G->ztpi;
+  G->zk->mp<<<(unsigned) ((count + per - 1) / per), GPU_TPB>>> (
+      G->ztpi, count, (uint32_t) half, tv, tree, out, G->nl, G->d_zN,
+      G->d_zR2, G->np0);
+  CUDA_CHECK (cudaGetLastError ());
 }
 
 int
@@ -1237,11 +1712,13 @@ gpu_roots_F (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
   for (uint32_t i0 = 0; i0 < s.steps; i0 += RT_SLICE)
     {
       uint32_t i1 = std::min (s.steps, i0 + RT_SLICE);
-      G->k->step<<<rt_blocks (G, ninst), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
           G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst,
           s.d_slots, 0, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den,
           G->d_N, G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_STEP);
     }
   return rt_finish (G, out, f, curve);
 }
@@ -1264,11 +1741,13 @@ gpu_roots_G (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
   for (uint32_t i0 = 0; i0 < its; i0 += RT_SLICE)
     {
       uint32_t i1 = std::min (its, i0 + RT_SLICE);
-      G->k->step<<<rt_blocks (G, ninst), GPU_TPB>>> (
+      rtp_begin (G->stream);
+      G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
           G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst, NULL,
           base, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den, G->d_N,
           G->np0);
       CUDA_CHECK (cudaGetLastError ());
+      rtp_end (G->stream, RP_STEP);
     }
   return rt_finish (G, out, f, curve);
 }

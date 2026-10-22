@@ -33,7 +33,7 @@ main (int argc, char **argv)
   mpz_urandomb (N, rs, bits);
   mpz_setbit (N, bits - 1);
   mpz_setbit (N, 0);
-  gpu_rns *R = gpu_rns_create (N, l + 1);
+  gpu_rns *R = gpu_rns_create (N, l + 1, 1);
   const int nl = gpu_rns_limbs (R);
   gpu_polyalg *A = gpu_polyalg_create (R, n);
   std::vector<uint32_t> h (n * nl, 0);

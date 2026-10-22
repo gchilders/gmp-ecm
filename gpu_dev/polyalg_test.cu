@@ -77,7 +77,7 @@ test (int bits, int l, int kblocks)
   mpz_urandomb (N, rs, bits);
   mpz_setbit (N, bits - 1);
   mpz_setbit (N, 0);
-  gpu_rns *R = gpu_rns_create (N, std::max (l + 1, 4));
+  gpu_rns *R = gpu_rns_create (N, std::max (l + 1, 4), 1);
   NL = gpu_rns_limbs (R);
   gpu_polyalg *A = gpu_polyalg_create (R, n);
 

@@ -4,7 +4,7 @@
    progressions.
 
    gcc -O2 -I<build dir> -c roots_ref.c
-   nvcc -O2 -arch=sm_86 -I.. -DGPU_ROOTS_MAX_L=4 \
+   nvcc -O2 -arch=sm_86 -I.. -DGPU_ROOTS_MAX_L=6 \
      -o roots_test roots_test.cu roots_ref.o <build dir>/.libs/libecm.a -lgmp
    ./roots_test */
 
@@ -193,6 +193,9 @@ main (int argc, char **argv)
        coefficients */
     { 400, -12, 2310, 13, "-4", 256, 3, 4, 4, 4 },
     { 300, 3, 210, 11, "-20", 24, 4, 3, 4, 3 },
+    /* wide groups (64 and 128 threads per curve), forced at a small N */
+    { 1000, -6, 2310, 13, "50", 240, 3, 3, 64, 6 },
+    { 600, -12, 2310, 1, "-3", 240, 2, 2, 128, 6 },
   };
   for (const tcase &t : cases)
     for (const char *nr : { (const char *) NULL, "1", "7" })

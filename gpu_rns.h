@@ -30,8 +30,9 @@
    ROWLEN words, entry c the residue of coefficient c), and a batch of B
    polynomials is B P rows, polynomial-major (row b P + i).  The primes are
    p = c 2^K + 1 < 2^30, with 2^K the longest transform, and enough of them
-   that a cyclic convolution of length up to 2^K of numbers below 2^(32 NL)
-   is exact (as GMP-ECM's mpzspm_init, prod p > 4 2^K (2^(32 NL) sum p)^2).
+   that a cyclic convolution of length up to 2^K of numbers below Bn is
+   exact and comes back through the CRT: prod p > 2^(K+1) Bn^2, with Bn =
+   2^(32 NL), or 2N if the context is made for inputs below 2N.
 
    Transforms: forward leaves the values in a permuted order (the same for
    every polynomial of a length), in [0, 2p); a pointwise product is a
@@ -49,8 +50,10 @@
 struct gpu_rns;
 
 /* Context for N with transforms up to 2^LG_WANT (fewer if there are not
-   enough primes: see gpu_rns_lg). */
-gpu_rns *gpu_rns_create (const mpz_t N, int lg_want);
+   enough primes: see gpu_rns_lg).  BELOW_2N: every input to a product
+   (gpu_rns_conv and the like) is below 2N (fewer primes); else they can be
+   anything below 2^(32 NL). */
+gpu_rns *gpu_rns_create (const mpz_t N, int lg_want, int below_2n = 0);
 void gpu_rns_destroy (gpu_rns *R);
 
 int gpu_rns_primes (const gpu_rns *R);   /* P */
@@ -75,31 +78,54 @@ void gpu_rns_to_z (gpu_rns *R, uint32_t *a, size_t sc, const uint32_t *res,
 void gpu_rns_ntt (gpu_rns *R, uint32_t *res, size_t rowlen, int rows, int lg,
                   int inv, int nmul);
 
-/* R = A * B pointwise (Montgomery) on the first LEN entries of ROWS rows;
+/* R = A * B pointwise (Montgomery) on the first LEN (a power of 2) entries
+   of ROWS rows;
    with BBC, B is one polynomial (P rows) for all.  R may be A or B. */
 void gpu_rns_mul (gpu_rns *R, uint32_t *r, const uint32_t *a,
                   const uint32_t *b, size_t rowlen, int rows, size_t len,
                   int bbc);
 
-/* OUT (P rows of 2^LG words) <- the forward transform of length 2^LG of B
-   (NB coefficients), for gpu_rns_conv's BPREP. */
-void gpu_rns_prep (gpu_rns *R, uint32_t *out, const uint32_t *b, size_t nb,
-                   int lg);
+/* OUT (BATCH P rows of 2^LG words) <- the forward transforms of length
+   2^LG of the BATCH polynomials of B (NB coefficients, polynomial j at
+   B + j SB), for gpu_rns_conv's BPREP. */
+void gpu_rns_prep (gpu_rns *R, uint32_t *out, const uint32_t *b, size_t sb,
+                   size_t nb, int lg, int batch);
 
 /* For each of BATCH pairs: entries O0 .. O0+OC-1 of the cyclic convolution
    of length 2^LG of A (NA coefficients, pair j at A + j SA) and B (NB
    coefficients at B + j SB; SB = 0: the same B for all; or, if BPREP is not
-   NULL, B's transform from gpu_rns_prep, for all), into C + j SC (numbers
-   below 2N).  NA, NB, O0 + OC <= 2^LG <= 2^K; the inputs below 2^(32 NL). */
+   NULL, B's transforms from gpu_rns_prep: one for all if SB = 0, else one
+   per pair), into C + j SC (numbers
+   below 2N).  NA, NB, O0 + OC <= 2^LG <= 2^K; the inputs below 2^(32 NL),
+   or 2N (see gpu_rns_create). */
 void gpu_rns_conv (gpu_rns *R, uint32_t *c, size_t sc, size_t o0, size_t oc,
                    const uint32_t *a, size_t sa, size_t na, const uint32_t *b,
                    size_t sb, size_t nb, const uint32_t *bprep, int lg,
                    int batch);
+
+/* The same with B's transforms from gpu_rns_prep only: pair j uses B
+   transform j / SHARE (SHARE >= BATCH: one for all). */
+void gpu_rns_conv_prep (gpu_rns *R, uint32_t *c, size_t sc, size_t o0,
+                        size_t oc, const uint32_t *a, size_t sa, size_t na,
+                        const uint32_t *bprep, int share, int lg, int batch);
+
+/* For each of BATCH pairs: the 2D low coefficients of (x^D + A)(x^D + B),
+   A and B of D coefficients (pair j at A + j SA, B + j SB), into C + j SC
+   (the product is monic of degree 2D).  2D a power of 2, <= 2^K. */
+void gpu_rns_conv_monic (gpu_rns *R, uint32_t *c, size_t sc,
+                         const uint32_t *a, size_t sa, const uint32_t *b,
+                         size_t sb, size_t d, int batch);
 
 /* Product of polynomials over Z/N: C = A B, A of NA and B of NB
    coefficients (Z/N form, device memory), C of NA + NB - 1, for BATCH
    products side by side.  NA + NB - 1 <= 2^K. */
 void gpu_rns_polymul (gpu_rns *R, uint32_t *c, const uint32_t *a, size_t na,
                       const uint32_t *b, size_t nb, int batch);
+
+/* Development: with GMPECM_RNS_PROF set, the time between these two (of
+   other kernels on Z/N numbers) is counted, and printed with the RNS
+   kernels' by gpu_rns_destroy. */
+void gpu_rns_prof_begin (void);
+void gpu_rns_prof_end (void);
 
 #endif /* _GPU_RNS_H */
