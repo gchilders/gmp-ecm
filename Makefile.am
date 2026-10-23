@@ -57,7 +57,7 @@ if WANT_GPU
   libecm_la_SOURCES += gpu_stage1.cu
   libecm_la_SOURCES += gpu_stage2.cu gpu_ntt.cu gpu_kernels.cu \
                        gpu_rns.cu gpu_polyalg.cu gpu_roots.cu gpu_s2poly.cu \
-                       gpu_kset_00.cu gpu_kset_01.cu gpu_kset_02.cu gpu_kset_03.cu gpu_kset_04.cu gpu_kset_05.cu gpu_kset_06.cu gpu_kset_07.cu gpu_kset_08.cu gpu_kset_09.cu gpu_kset_10.cu gpu_kset_11.cu gpu_kset_12.cu gpu_kset_13.cu
+                       gpu_kset_00.cu gpu_kset_01.cu gpu_kset_02.cu gpu_kset_03.cu gpu_kset_04.cu gpu_kset_05.cu gpu_kset_06.cu gpu_kset_07.cu gpu_kset_08.cu gpu_kset_09.cu gpu_kset_10.cu gpu_kset_11.cu gpu_kset_12.cu gpu_kset_13.cu gpu_kset_14.cu gpu_kset_15.cu gpu_kset_16.cu gpu_kset_17.cu gpu_kset_18.cu gpu_kset_19.cu
   libecm_la_LIBADD += $(CUDALIB)
   libecm_la_LDFLAGS += $(CUDALDFLAGS)
   ecm_LDFLAGS = $(CUDARPATH)
@@ -162,6 +162,12 @@ gpu_kset_10.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kern
 gpu_kset_11.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 gpu_kset_12.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 gpu_kset_13.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_14.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_15.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_16.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_17.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_18.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
+gpu_kset_19.lo: gpu_kset.cuh gpu_kernels.h gpu_stage1_kernel.cuh gpu_stage2_kernel.cuh gpu_mont.cuh gpu_common.cuh
 endif
 
 ecm-params:	bench_mulredc$(EXEEXT) tune$(EXEEXT)

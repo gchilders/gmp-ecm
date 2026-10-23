@@ -963,13 +963,157 @@ GM_DEV void gm_mul_dist (const gm_wgroup &g, uint32_t (&r)[L],
 #endif
 }
 
+/* ---- solo product, even L: even/odd accumulators -------------------- */
+
+/* The rotating accumulator of gm_row shifts by one limb per row, so the
+ * (lo, hi) words of a product a_j x land in a register pair in one row and
+ * straddle two pairs in the next; for TPI = 1, where a whole product is
+ * unrolled in one thread, ptxas then spends about as many moves as
+ * IMAD.WIDEs re-pairing them.  These keep the accumulator T as P + W Q
+ * instead: P[k] at limb k and Q[k] at limb k + 1, so that the products of
+ * the even limbs of a land on the pairs (P[j], P[j+1]) and those of the odd
+ * limbs on (Q[j-1], Q[j]), always aligned.  After a row's reduction P[0] is
+ * zero and T / W = (Q + P[1]) + W (P >> 2 limbs): the arrays swap roles,
+ * and the shift by two limbs (which keeps the pairs aligned) is folded into
+ * the next row's products.  L must be even.  The bounds are those of
+ * gm_mul: every partial T is below a + m < R, so nothing carries out of
+ * limb L. */
+
+/* x (+)= a_(j+o) y over even j, as one fused chain into the aligned pairs
+   (x[j], x[j+1]); FIRST: x = the products, no carry in or out; else the
+   carry out of x[L-1] is left in CC */
+template<int L, bool FIRST>
+GM_DEV void gm_eo_mad (uint32_t (&x)[L], const uint32_t (&a)[L], int o,
+                       uint32_t y)
+{
+#pragma unroll
+  for (int j = 0; j < L; j += 2)
+    if (FIRST)
+      {
+        x[j] = a[j + o] * y;
+        x[j + 1] = __umulhi (a[j + o], y);
+      }
+    else
+      {
+        x[j] = j == 0 ? madlo_cc (a[j + o], y, x[j])
+                      : madclo_cc (a[j + o], y, x[j]);
+        x[j + 1] = madchi_cc (a[j + o], y, x[j + 1]);
+      }
+}
+
+/* x = a_(j+1) y + (x >> 2 limbs) + CC over even j (the odd limbs of a into
+   the pairs of a Q, from the P of the row before); the top pair gets the
+   product alone, and nothing carries out */
+template<int L>
+GM_DEV void gm_eo_mad_shift (uint32_t (&x)[L], const uint32_t (&a)[L],
+                             uint32_t y)
+{
+#pragma unroll
+  for (int j = 0; j < L - 2; j += 2)
+    {
+      x[j] = madclo_cc (a[j + 1], y, x[j + 2]);
+      x[j + 1] = madchi_cc (a[j + 1], y, x[j + 3]);
+    }
+  x[L - 2] = madclo_cc (a[L - 1], y, 0);
+  x[L - 1] = madchi (a[L - 1], y, 0);
+}
+
+/* One row: T = T / W + a x, then + q m with q making limb 0 zero.  On
+   entry (not FIRST) the row before left P in Q's array and Q in P's (the
+   caller swaps the arguments): P' = Q + P[1], Q' = P >> 2 limbs. */
+template<int L, bool FIRST>
+GM_DEV void gm_eo_row (uint32_t (&p)[L], uint32_t (&q)[L],
+                       const uint32_t (&a)[L], uint32_t x,
+                       const uint32_t (&m)[L], uint32_t mp0)
+{
+  if (FIRST)
+    {
+      gm_eo_mad<L, true> (p, a, 0, x);
+      gm_eo_mad<L, true> (q, a, 1, x);
+    }
+  else
+    {
+      /* p holds the old Q, q the old P: p[0] += old P[1]; its carry (at
+         limb 1) is Q's limb 0, taken in by the first mad of the shift */
+      p[0] = add_cc (p[0], q[1]);
+      gm_eo_mad_shift<L> (q, a, x);
+      gm_eo_mad<L, false> (p, a, 0, x);
+      q[L - 1] = addc (q[L - 1], 0);          /* P's carry, at limb L */
+    }
+  const uint32_t qm = p[0] * mp0;
+  gm_eo_mad<L, false> (q, m, 1, qm);         /* no carry out: T < W^(L+1) */
+  gm_eo_mad<L, false> (p, m, 0, qm);
+  q[L - 1] = addc (q[L - 1], 0);
+}
+
+/* rows I and I + 1 (the second with the arrays swapped), then the rest */
+template<int L, int I>
+struct gm_eo_rows {
+  GM_DEV static void run (uint32_t (&p)[L], uint32_t (&q)[L],
+                          const uint32_t (&a)[L], const uint32_t (&b)[L],
+                          const uint32_t (&m)[L], uint32_t mp0)
+  {
+    gm_eo_row<L, I == 0> (p, q, a, b[I], m, mp0);
+    gm_eo_row<L, false> (q, p, a, b[I + 1], m, mp0);
+    gm_eo_rows<L, I + 2>::run (p, q, a, b, m, mp0);
+  }
+};
+template<int L>
+struct gm_eo_rows<L, L> {
+  GM_DEV static void run (uint32_t (&)[L], uint32_t (&)[L],
+                          const uint32_t (&)[L], const uint32_t (&)[L],
+                          const uint32_t (&)[L], uint32_t) {}
+};
+
+/* r = (Q + P[1]) + W (P >> 2): T / W after the last row, P in P's array */
+template<int L>
+GM_DEV void gm_eo_final (uint32_t (&r)[L], const uint32_t (&p)[L],
+                         const uint32_t (&q)[L])
+{
+  r[0] = add_cc (q[0], p[1]);
+#pragma unroll
+  for (int k = 1; k < L - 1; k++)
+    r[k] = addc_cc (q[k], p[k + 1]);
+  r[L - 1] = addc (q[L - 1], 0);
+}
+
+/* r = a * b / R mod m, solo, L even (r may alias a or b) */
+template<int L>
+GM_DEV void gm_mul_eo (uint32_t (&r)[L], const uint32_t (&a)[L],
+                       const uint32_t (&b)[L], const uint32_t (&m)[L],
+                       uint32_t mp0)
+{
+  uint32_t p[L], q[L];
+  gm_eo_rows<L, 0>::run (p, q, a, b, m, mp0);
+  /* L rows: the last (odd) one had the arrays swapped, so P is in q */
+  gm_eo_final<L> (r, q, p);
+}
+
+/* r = a * d / 2^32 mod m for a 32-bit d, solo, L even: one row */
+template<int L>
+GM_DEV void gm_mul_ui_eo (uint32_t (&r)[L], const uint32_t (&a)[L],
+                          uint32_t d, const uint32_t (&m)[L], uint32_t mp0)
+{
+  uint32_t p[L], q[L];
+  gm_eo_row<L, true> (p, q, a, d, m, mp0);
+  gm_eo_final<L> (r, p, q);
+}
+
+/* the even/odd product for solo kernels of even L */
+template<int L, bool SOLO>
+struct gm_use_eo {
+  static constexpr bool value = SOLO && L >= 2 && L % 2 == 0;
+};
+
 /* r = a * b / R mod m (lazy, see top of file).  r may alias a or b. */
 template<int L, bool SOLO, class G>
 GM_DEV void gm_mul (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&b)[L],
                     const uint32_t (&m)[L], uint32_t mp0)
 {
-  if constexpr (!SOLO && L >= (G::wide ? 4 : 2))
+  if constexpr (gm_use_eo<L, SOLO>::value)
+    gm_mul_eo<L> (r, a, b, m, mp0);
+  else if constexpr (!SOLO && L >= (G::wide ? 4 : 2))
     gm_mul_dist<L> (g, r, a, b, m, mp0);
   else
     {
@@ -1107,6 +1251,13 @@ GM_DEV void gm_sqr (const G &g, uint32_t (&r)[L],
                     const uint32_t (&a)[L], const uint32_t (&m)[L],
                     uint32_t mp0)
 {
+#ifndef GM_SOLO_OLD_SQR
+  /* the even/odd product beats the squaring below, whose rows shift the
+     pairs as gm_row does */
+  if constexpr (gm_use_eo<L, SOLO>::value)
+    gm_mul_eo<L> (r, a, a, m, mp0);
+  else
+#endif
   if (SOLO && L > 1)
     gm_sqr_solo<L> (r, a, m, mp0);
   else
@@ -1119,6 +1270,11 @@ GM_DEV void gm_mul_ui (const G &g, uint32_t (&r)[L],
                        const uint32_t (&a)[L], uint32_t d,
                        const uint32_t (&m)[L], uint32_t mp0)
 {
+  if constexpr (gm_use_eo<L, SOLO>::value)
+    {
+      gm_mul_ui_eo<L> (r, a, d, m, mp0);
+      return;
+    }
   uint32_t acc[L];
 #pragma unroll
   for (int k = 0; k < L; k++)

@@ -35,6 +35,12 @@ void gpu_kset_10 (gpu_kernel_table *);
 void gpu_kset_11 (gpu_kernel_table *);
 void gpu_kset_12 (gpu_kernel_table *);
 void gpu_kset_13 (gpu_kernel_table *);
+void gpu_kset_14 (gpu_kernel_table *);
+void gpu_kset_15 (gpu_kernel_table *);
+void gpu_kset_16 (gpu_kernel_table *);
+void gpu_kset_17 (gpu_kernel_table *);
+void gpu_kset_18 (gpu_kernel_table *);
+void gpu_kset_19 (gpu_kernel_table *);
 
 const gpu_kernel_set *
 gpu_kernels (uint32_t tpi, uint32_t L)
@@ -58,6 +64,12 @@ gpu_kernels (uint32_t tpi, uint32_t L)
       gpu_kset_11 (&t);
       gpu_kset_12 (&t);
       gpu_kset_13 (&t);
+      gpu_kset_14 (&t);
+      gpu_kset_15 (&t);
+      gpu_kset_16 (&t);
+      gpu_kset_17 (&t);
+      gpu_kset_18 (&t);
+      gpu_kset_19 (&t);
       init = 1;
     }
   const gpu_kernel_set *k;

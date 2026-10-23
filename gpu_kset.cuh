@@ -31,10 +31,13 @@ template<int L, int HI, bool SOLO, bool DONE = (L > HI)>
 struct gpu_kset_fill {
   static void run (gpu_kernel_set *t)
   {
-    t[L].s1 = gpu_stage1_kernel<L, SOLO>;
-    t[L].s2_setup = s2_setup_kernel<L, SOLO>;
-    t[L].s2_norm = s2_norm_kernel<L, SOLO>;
-    t[L].s2_main = s2_main_kernel<L, SOLO>;
+    if constexpr (!SOLO || L <= GPU_SOLO_ODD_MAX_L || L % 2 == 0)
+      {
+        t[L].s1 = gpu_stage1_kernel<L, SOLO>;
+        t[L].s2_setup = s2_setup_kernel<L, SOLO>;
+        t[L].s2_norm = s2_norm_kernel<L, SOLO>;
+        t[L].s2_main = s2_main_kernel<L, SOLO>;
+      }
     gpu_kset_fill<L + 1, HI, SOLO>::run (t);
   }
 };

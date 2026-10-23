@@ -343,28 +343,34 @@ gpu_ecm_stage1_plan (const mpz_t N, unsigned int *curves, int verbose)
     {
       if (force_tpi && tpi != force_tpi)
         continue;
-      uint32_t L = (n_min + tpi - 1) / tpi;
+      uint32_t L0 = (n_min + tpi - 1) / tpi;
       if (force_L)
         {
-          if (force_L < L)
+          if (force_L < L0)
             continue;
-          L = force_L;
+          L0 = force_L;
         }
-      else if (tpi > 1 && L < 2 && n_min > 1)
+      else if (tpi > 1 && L0 < 2 && n_min > 1)
         continue;   /* never better than fewer threads with more limbs */
-      const gpu_kernel_set *ks = gpu_kernels (tpi, L);
-      gpu_s1_fn fn = ks != NULL ? ks->s1 : NULL;
-      if (fn == NULL)
-        continue;
-      gpu_plan_t p;
-      p.n_min = n_min;
-      p.req_curves = *curves;
-      p.tpi = tpi;
-      p.L = L;
-      p.fn = fn;
-      p.ntt = NULL;
-      p.curves = *curves ? *curves : fill_curves (fn, tpi);
-      cand.push_back (p);
+      /* solo: an odd L also as L + 1, which has the even/odd product of
+         gpu_mont.cuh (above GPU_SOLO_ODD_MAX_L only that one exists) */
+      const uint32_t nL = tpi == 1 && !force_L && L0 % 2 == 1 ? 2 : 1;
+      for (uint32_t L = L0; L < L0 + nL; L++)
+        {
+          const gpu_kernel_set *ks = gpu_kernels (tpi, L);
+          gpu_s1_fn fn = ks != NULL ? ks->s1 : NULL;
+          if (fn == NULL)
+            continue;
+          gpu_plan_t p;
+          p.n_min = n_min;
+          p.req_curves = *curves;
+          p.tpi = tpi;
+          p.L = L;
+          p.fn = fn;
+          p.ntt = NULL;
+          p.curves = *curves ? *curves : fill_curves (fn, tpi);
+          cand.push_back (p);
+        }
     }
   if (beyond_warp && !force_tpi && ntt_fits)
     cand.push_back (ntt_plan (N, lg, n_min, *curves));

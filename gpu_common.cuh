@@ -26,7 +26,10 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <gmp.h>
 
 #define GPU_TPB 128
-#define GPU_SOLO_MAX_L 16
+#define GPU_SOLO_MAX_L 28
+/* above this, solo kernels only for even L (the even/odd product of
+   gpu_mont.cuh); an odd number of limbs takes the next even L */
+#define GPU_SOLO_ODD_MAX_L 16
 #define GPU_DIST_MAX_L 24
 #define GPU_WIDE_MAX_TPI 128   /* wide groups: 64 or 128 threads per curve */
 /* N must be below 2^(32n - GPU_SPARE_BITS) */
