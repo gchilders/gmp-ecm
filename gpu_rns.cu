@@ -173,6 +173,7 @@ struct gpu_rns {
   unsigned long long ninv;          /* -1/N mod 2^64 */
   uint32_t *d_tmp;                  /* polymul scratch */
   size_t tmp_words;
+  std::vector<uint32_t *> d_negmap; /* [K+1]: per length, see negmap () */
   std::vector<void *> dev;
 };
 
@@ -2118,7 +2119,7 @@ gpu_rns_conv (gpu_rns *R, uint32_t *c, size_t sc, size_t o0, size_t oc,
 void
 gpu_rns_conv_monic (gpu_rns *R, uint32_t *c, size_t sc, const uint32_t *a,
                     size_t sa, const uint32_t *b, size_t sb, size_t d,
-                    int batch)
+                    int batch, uint32_t *keepx, uint32_t *keepy)
 {
   int lg = 0;
   while (((size_t) 1 << lg) < 2 * d)
@@ -2126,17 +2127,110 @@ gpu_rns_conv_monic (gpu_rns *R, uint32_t *c, size_t sc, const uint32_t *a,
   assert (((size_t) 1 << lg) == 2 * d && lg <= R->K);
   const size_t len = 2 * d;
   const int rows = batch * R->P;
-  uint32_t *X = scratch (R, (size_t) 2 * rows * len);
-  uint32_t *Y = X + (size_t) rows * len;
+  uint32_t *Z = scratch (R, (size_t) (keepx ? 1 : 2) * rows * len);
+  uint32_t *X = keepx ? keepx : Z, *Y = keepx ? keepy : Z + (size_t) rows * len;
   /* x^d + A and x^d + B: their cyclic product of length 2d has the x^2d
      term at x^0 */
   from_z (R, X, len, a, sa, d, batch, d);
   from_z (R, Y, len, b, sb, d, batch, d);
   gpu_rns_ntt (R, X, len, rows, lg, 0, 0);
   gpu_rns_ntt (R, Y, len, rows, lg, 0, 0);
-  rns_mul (R, X, X, Y, len, rows, len, 1);
+  rns_mul (R, Z, X, Y, len, rows, len, 1);
+  gpu_rns_ntt (R, Z, len, rows, lg, 1, 1);
+  to_z (R, c, sc, Z, len, len, batch, 1);
+}
+
+/* For transforms of length 2^LG: entry e of the result is the position of
+   frequency -f, f the frequency at e, plus 2^31 if (-1)^f = -1.  Found
+   once per length from the transform of the polynomial x, whatever order
+   the transform leaves (entry e holds w^f). */
+static const uint32_t *
+negmap (gpu_rns *R, int lg)
+{
+  if ((int) R->d_negmap.size () <= lg)
+    R->d_negmap.resize (lg + 1, NULL);
+  if (R->d_negmap[lg] != NULL)
+    return R->d_negmap[lg];
+  const size_t len = (size_t) 1 << lg;
+  std::vector<uint32_t> h ((size_t) R->P * len, 0);
+  for (int i = 0; i < R->P; i++)
+    h[(size_t) i * len + 1] = 1;
+  uint32_t *d;
+  CUDA_CHECK (cudaMalloc ((void **) &d, h.size () * 4));
+  CUDA_CHECK (cudaMemcpy (d, h.data (), h.size () * 4, cudaMemcpyHostToDevice));
+  gpu_rns_ntt (R, d, len, R->P, lg, 0, 0);
+  CUDA_CHECK (cudaMemcpy (h.data (), d, len * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK (cudaFree (d));
+  const uint64_t p = R->p[0];
+  std::vector<std::pair<uint32_t, uint32_t> > pos (len);
+  for (size_t e = 0; e < len; e++)
+    pos[e] = std::make_pair ((uint32_t) (h[e] % p), (uint32_t) e);
+  std::sort (pos.begin (), pos.end ());
+  std::vector<uint32_t> map (len);
+  for (size_t e = 0; e < len; e++)
+    {
+      const uint64_t w = h[e] % p, wi = powmod64 (w, p - 2, p);
+      auto it = std::lower_bound (pos.begin (), pos.end (),
+                                  std::make_pair ((uint32_t) wi, (uint32_t) 0));
+      assert (it != pos.end () && it->first == wi);
+      const bool neg = powmod64 (w, len / 2, p) != 1;
+      map[e] = it->second | (neg ? 0x80000000u : 0);
+    }
+  R->d_negmap[lg] = upload (R, map);
+  return R->d_negmap[lg];
+}
+
+/* r (2 NODES P rows) = B's transforms times the children's at -f, less the
+   x^d term ((-1)^f): item 2j the right child (KY), 2j + 1 the left (KX) */
+__global__ void
+k_mul_corr (uint32_t *r, const uint32_t *bp, const uint32_t *kx,
+            const uint32_t *ky, int lg, int P, size_t nodes,
+            const uint32_t *map, const uint32_t *pr, const uint32_t *pinv)
+{
+  const size_t len = (size_t) 1 << lg, total = 2 * nodes * P << lg;
+  for (size_t x = (size_t) blockIdx.x * blockDim.x + threadIdx.x; x < total;
+       x += (size_t) gridDim.x * blockDim.x)
+    {
+      const size_t row = x >> lg, e = x & (len - 1);
+      const size_t item = row / P, q = row % P, src = (item >> 1) * P + q;
+      const uint32_t m = map[e], p = pr[q], p2 = 2 * p;
+      const uint32_t *k = (item & 1) ? kx : ky;
+      /* the child alone: x^d + a at -f, less (-1)^f */
+      uint32_t c = k[src * len + (m & 0x7fffffffu)] + p2
+                   - ((m >> 31) ? p - 1 : 1);
+      c = rns_red (c, p2);
+      r[x] = rns_mont (bp[src * len + e], c, p, pinv[q]);
+    }
+}
+
+void
+gpu_rns_corr_kept (gpu_rns *R, uint32_t *c, size_t sc, size_t oc,
+                   const uint32_t *bprep, const uint32_t *keepx,
+                   const uint32_t *keepy, size_t d, int nodes)
+{
+  int lg = 0;
+  while (((size_t) 1 << lg) < 2 * d)
+    lg++;
+  assert (((size_t) 1 << lg) == 2 * d && lg <= R->K && oc <= d);
+  const size_t len = 2 * d;
+  const int rows = 2 * nodes * R->P;
+  const uint32_t *map = negmap (R, lg);
+  uint32_t *X = scratch (R, (size_t) rows * len);
+  rns_prof.lg = lg;
+  rp_begin ();
+  k_mul_corr<<<flat_blocks ((size_t) rows << lg), 256>>> (
+      X, bprep, keepx, keepy, lg, R->P, (size_t) nodes, map, R->d_p,
+      R->d_pinv);
+  CUDA_CHECK (cudaGetLastError ());
+  rp_end (RP_MUL);
   gpu_rns_ntt (R, X, len, rows, lg, 1, 1);
-  to_z (R, c, sc, X, len, len, batch, 1);
+  gpu_rns_to_z (R, c, sc, X, len, oc, 2 * nodes);
+}
+
+void
+gpu_rns_reserve (gpu_rns *R, size_t words)
+{
+  scratch (R, words);
 }
 
 void

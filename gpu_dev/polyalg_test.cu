@@ -68,8 +68,9 @@ check (const char *what, int bits, size_t n, int bad, size_t total)
     }
 }
 
+/* CACHE: 0 no tree transforms kept, 1 all levels, 2 the top level */
 static void
-test (int bits, int l, int kblocks)
+test (int bits, int l, int kblocks, int cache)
 {
   const size_t n = (size_t) 1 << l;
   mpz_t N, t, u, x;
@@ -80,6 +81,8 @@ test (int bits, int l, int kblocks)
   gpu_rns *R = gpu_rns_create (N, std::max (l + 1, 4), 1);
   NL = gpu_rns_limbs (R);
   gpu_polyalg *A = gpu_polyalg_create (R, n);
+  gpu_polyalg_treecache (A, cache == 0 ? 0 : cache == 1 ? (size_t) -1
+                            : (size_t) 2 * gpu_rns_primes (R) * n * 4);
 
   zvec f (n);
   for (size_t i = 0; i < n; i++)
@@ -261,9 +264,9 @@ test (int bits, int l, int kblocks)
     }
   check ("tpeval vs Horner", bits, n, bad_h, n);
   check ("chain vs prod (g - f)", bits, n, bad_v, n);
-  printf ("%5d bits, n = %5zu, %d blocks (%d primes, K = %d): %s\n", bits, n,
-          kblocks, gpu_rns_primes (R), gpu_rns_lg (R),
-          failures ? "failures so far" : "ok");
+  printf ("%5d bits, n = %5zu, %d blocks (%d primes, K = %d, %d levels "
+          "kept): %s\n", bits, n, kblocks, gpu_rns_primes (R), gpu_rns_lg (R),
+          gpu_polyalg_kept (A), failures ? "failures so far" : "ok");
   fflush (stdout);
 
   for (auto &p : tree)
@@ -282,7 +285,8 @@ main ()
   gmp_randseed_ui (rs, 77);
   for (int bits : { 256, 1024, 4096 })
     for (int l : { 0, 1, 2, 4, 8, 10 })
-      test (bits, l, l == 0 ? 2 : 3);
+      for (int cache : { 0, 1, 2 })
+        test (bits, l, l == 0 ? 2 : 3, cache);
   printf ("%s (%d failures)\n", failures ? "FAILED" : "ALL OK", failures);
   return failures != 0;
 }

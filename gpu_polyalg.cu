@@ -74,6 +74,11 @@ struct gpu_polyalg {
                  size_t, size_t);
   size_t mpmax;
   std::vector<void *> dev;
+  /* kept transforms of F's tree (gpu_polyalg_treecache): kx[t], ky[t] the
+     left and right children of the nodes of level t of the transposed
+     evaluation (children of degree n / 2^(t+1)), as the tree build made
+     them; NULL where not kept */
+  std::vector<uint32_t *> kx, ky;
 };
 
 /* ---- numbers ---------------------------------------------------------- */
@@ -381,6 +386,16 @@ gpu_polyalg_create (gpu_rns *R, size_t n, int B)
     }
   A->F = NULL;
   A->Iprep = A->Fprep = A->invFprep = NULL;
+  if (A->l + 1 <= gpu_rns_lg (R))
+    {
+      /* gpu_poly_prepare's transforms, now so that gpu_polyalg_treecache
+         budgets with them */
+      const size_t words = (size_t) B * gpu_rns_primes (R) << (A->l + 1);
+      CUDA_CHECK (cudaMalloc ((void **) &A->Iprep, 3 * words * 4));
+      A->dev.push_back (A->Iprep);
+      A->Fprep = A->Iprep + words;
+      A->invFprep = A->Fprep + words;
+    }
   CUDA_CHECK (cudaMalloc ((void **) &A->Tprep,
                           (size_t) gpu_rns_primes (R) * n * B * 4));
   A->dev.push_back (A->Tprep);
@@ -388,6 +403,8 @@ gpu_polyalg_create (gpu_rns *R, size_t n, int B)
   A->lowctx = NULL;
   A->lowmax = 0;
   A->lowmp = NULL;
+  A->kx.assign (A->l > 0 ? A->l : 1, NULL);
+  A->ky.assign (A->l > 0 ? A->l : 1, NULL);
   A->mpmax = 0;
   return A;
 }
@@ -412,6 +429,35 @@ gpu_polyalg_lowmp (gpu_polyalg *A,
   A->lowmp = fn;
   A->lowctx = ctx;
   A->mpmax = fn != NULL ? hmax : 0;
+}
+
+void
+gpu_polyalg_treecache (gpu_polyalg *A, size_t bytes)
+{
+  /* each level: the transforms of its nodes' two children, P rows of 2d
+     for each pair, from the top down to the levels done in Z/N */
+  const size_t n = A->n, nb = n * A->B;
+  const size_t level = (size_t) 2 * gpu_rns_primes (A->R) * nb * 4;
+  for (size_t d = n / 2; d > A->lowmax && d > A->mpmax; d /= 2)
+    {
+      const int t = A->l - 1 - lg2 (d);
+      if (A->kx[t] != NULL || bytes < level)
+        continue;
+      CUDA_CHECK (cudaMalloc ((void **) &A->kx[t], level / 2));
+      CUDA_CHECK (cudaMalloc ((void **) &A->ky[t], level / 2));
+      A->dev.push_back (A->kx[t]);
+      A->dev.push_back (A->ky[t]);
+      bytes -= level;
+    }
+}
+
+int
+gpu_polyalg_kept (const gpu_polyalg *A)
+{
+  int c = 0;
+  for (const uint32_t *p : A->kx)
+    c += p != NULL;
+  return c;
 }
 
 void
@@ -451,6 +497,7 @@ gpu_poly_from_roots (gpu_polyalg *A, uint32_t *F, uint32_t **tree,
   for (size_t d = 1; d < n; d *= 2)
     {
       const int lgd = lg2 (2 * d);
+      const int t = l - 1 - lg2 (d);
       uint32_t *dst = 2 * d == n ? F
                       : tree != NULL ? tree[l - 1 - lgd] : A->t[ping ^= 1];
       if (d <= A->lowmax)
@@ -461,7 +508,9 @@ gpu_poly_from_roots (gpu_polyalg *A, uint32_t *F, uint32_t **tree,
         }
       else
         gpu_rns_conv_monic (A->R, dst, 2 * d, cur, 2 * d, cur + d * nl,
-                            2 * d, d, (int) (nb / (2 * d)));
+                            2 * d, d, (int) (nb / (2 * d)),
+                            tree != NULL ? A->kx[t] : NULL,
+                            tree != NULL ? A->ky[t] : NULL);
       cur = dst;
     }
 }
@@ -602,10 +651,17 @@ gpu_poly_tpeval (gpu_polyalg *A, uint32_t *vals, const uint32_t *H,
          (j's right child) gives left half j and item 2j + 1 right half j:
          left halves MP (right child, b), right halves MP (left child, b),
          with b's transforms shared by the two */
-      zn_rev (A, revT, half, tree[t], half, half, nb / half, 1);
       gpu_rns_prep (A->R, A->Tprep, T, k, k, lgk, (int) nodes);
-      gpu_rns_conv_prep (A->R, T2, half, half - 1, half, revT, half, half,
-                         A->Tprep, 2, lgk, (int) (2 * nodes));
+      if (A->kx[t] != NULL)
+        /* the children's transforms kept from the tree build */
+        gpu_rns_corr_kept (A->R, T2, half, half, A->Tprep, A->kx[t],
+                           A->ky[t], half, (int) nodes);
+      else
+        {
+          zn_rev (A, revT, half, tree[t], half, half, nb / half, 1);
+          gpu_rns_conv_prep (A->R, T2, half, half - 1, half, revT, half,
+                             half, A->Tprep, 2, lgk, (int) (2 * nodes));
+        }
       zn_lin (A, T2, k, T2, k, T + half * nl, k, half, nodes, ZN_ADD);
       zn_lin (A, T2 + half * nl, k, T2 + half * nl, k, T + half * nl, k, half,
               nodes, ZN_ADD);

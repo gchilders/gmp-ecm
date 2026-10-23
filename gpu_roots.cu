@@ -59,7 +59,13 @@
  * The lanes of a group exchange limbs by warp shuffles, so every instance of
  * a warp runs the same products: loops have the same trip count for all
  * instances, and only loads and stores depend on the instance (padding
- * instances repeat the last one and store nothing). */
+ * instances repeat the last one and store nothing).
+ *
+ * For large N (from 12000 bits, when they time faster: rt_pick_ntt) the
+ * same computations run on the transform products of gpu_nmul.cuh
+ * instead, one block per instance ("NTT backend" below); and so, chosen
+ * separately, do the Z/N tree and transposed-evaluation levels up to
+ * degree NT_ZMAX. */
 
 #include "gpu_roots.h"
 
@@ -75,6 +81,7 @@
 #include "cudacommon.h"
 #include "gpu_common.cuh"
 #include "gpu_mont.cuh"
+#include "gpu_nmul.cuh"
 
 /* kernels for L up to this (dev builds instantiate fewer) */
 #ifndef GPU_ROOTS_MAX_L
@@ -823,6 +830,410 @@ rt_mp_wkernel (uint32_t tpi, uint64_t count, uint32_t half,
   rt_mp_body<L> (g, tpi, count, half, tv, tree, out, nl, Ng, R2g, np0);
 }
 
+/* ---- NTT backend (gpu_nmul.cuh) ----------------------------------------- */
+
+/* For large N the curve arithmetic can run on transform products instead:
+ * numbers are D signed digits (D words, contiguous; Montgomery form with
+ * R = B^D - 1), one block of D/8 threads per instance, each block looping
+ * over instances with its own scratch (NT_SCR words).  The same tables as
+ * above in the same order, with D words per number; progression state
+ * point t of instance i at numbers (i (S + 1) + t) 4.  Each curve's a, d,
+ * C1, C2, C3 are also kept as hats (RH_*).  An addition is 98 transforms
+ * per prime: the second point's coordinates and X2 + Y2 are transformed
+ * once each, the five products with them take the first point's numbers
+ * as digits; E, F, G, H are transformed once for the last four products.
+ * In a step, addition k + 1's first point is addition k's second (not yet
+ * updated), so its hats carry over: 88 transforms. */
+enum { RH_A, RH_D, RH_C1, RH_C2, RH_C3, RH_COUNT };
+#define NT_NUMS 16                 /* scratch numbers; 12 .. 15: a point */
+#define NT_HATS 14                 /* two sets of 5 (X, Y, Z, T, X + Y), 4 */
+#define NT_SCR(D) ((size_t) (NT_NUMS + 4 * NT_HATS) * (D))
+/* threads per SM the register budget allows: 64 registers at 4096 */
+#define NT_MINB(lg) ((lg) >= 12 ? 2 : 1024 / ((1 << (lg)) / 8) / 2)
+
+template<int LG>
+static __device__ __forceinline__ void
+nt_copy_pt (int32_t *r, const int32_t *a)
+{
+  constexpr int D = 1 << LG;
+#pragma unroll
+  for (int k = 0; k < 4; k++)
+    nm_copy<LG> (r + k * D, a + k * D);
+}
+
+/* R = P + Q (points of four numbers X, Y, Z, T), as rt_add; HC: the
+   curve's hats; R may alias P or Q.  HQ (scratch hat set 0 or 1) gets
+   the hats of Q's X, Y, Z, T, X + Y; HP, if not NULL, holds P's. */
+template<int LG>
+static __device__ __noinline__ void
+nt_add (const nm_ctx &c, int32_t *R, const int32_t *P, const int32_t *Q,
+        const uint32_t *hc, int32_t *s, int hq, int hp)
+{
+  constexpr int D = 1 << LG;
+  int32_t *S1 = s, *S2 = s + D, *A = s + 2 * D, *B = s + 3 * D;
+  int32_t *C = s + 4 * D, *Dd = s + 5 * D, *E = s + 6 * D, *F = s + 7 * D;
+  int32_t *Gg = s + 8 * D, *H = s + 9 * D;
+  uint32_t *h = (uint32_t *) (s + NT_NUMS * D);
+  uint32_t *q = h + hq * 20 * D, *p = h + hp * 20 * D;
+  uint32_t *hX = q, *hY = q + 4 * D, *hZ = q + 8 * D, *hT = q + 12 * D;
+  uint32_t *hS = q + 16 * D, *hE = h + 40 * D, *hF = h + 44 * D;
+  uint32_t *hG = h + 48 * D, *hH = h + 52 * D;
+  nm_add<LG> (S2, Q, Q + D);
+  nm_hat<LG> (c, hX, Q);
+  nm_hat<LG> (c, hY, Q + D);
+  nm_hat<LG> (c, hZ, Q + 2 * D);
+  nm_hat<LG> (c, hT, Q + 3 * D);
+  nm_hat<LG> (c, hS, S2);
+  if (hp >= 0)
+    {
+      nm_mulhh<LG> (c, A, p, hX);
+      nm_mulhh<LG> (c, B, p + 4 * D, hY);
+      nm_mulhh<LG> (c, C, p + 12 * D, hT);
+      nm_mulhh<LG> (c, Dd, p + 8 * D, hZ);
+      nm_mulhh<LG> (c, E, p + 16 * D, hS);
+    }
+  else
+    {
+      nm_add<LG> (S1, P, P + D);
+      nm_mul<LG> (c, A, P, hX);
+      nm_mul<LG> (c, B, P + D, hY);
+      nm_mul<LG> (c, C, P + 3 * D, hT);
+      nm_mul<LG> (c, Dd, P + 2 * D, hZ);
+      nm_mul<LG> (c, E, S1, hS);
+    }
+  nm_mul<LG> (c, C, C, hc + RH_D * 4 * D);        /* C = d T1 T2 */
+  nm_sub<LG> (E, E, A);
+  nm_sub<LG> (E, E, B);                           /* (X1+Y1)(X2+Y2)-A-B */
+  nm_mul<LG> (c, A, A, hc + RH_A * 4 * D);
+  nm_sub<LG> (H, B, A);                           /* H = B - a A */
+  nm_add<LG> (Gg, Dd, C);                         /* G = D + C */
+  nm_sub<LG> (F, Dd, C);                          /* F = D - C */
+  nm_hat<LG> (c, hE, E);
+  nm_hat<LG> (c, hF, F);
+  nm_hat<LG> (c, hG, Gg);
+  nm_hat<LG> (c, hH, H);
+  nm_mulhh<LG> (c, R, hE, hF);
+  nm_mulhh<LG> (c, R + D, hG, hH);
+  nm_mulhh<LG> (c, R + 3 * D, hE, hH);
+  nm_mulhh<LG> (c, R + 2 * D, hF, hG);
+}
+
+/* as rt_setup_body; identity digits zero skipped (the same point up to a
+   projective factor, so the same roots) */
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_setup_kernel (const __grid_constant__ nm_ctx c, int mode, uint32_t count,
+                 const int32_t * __restrict__ cst,
+                 const uint32_t * __restrict__ chat, int32_t * __restrict__ W,
+                 uint32_t K, uint32_t w, uint32_t nw, uint32_t k0,
+                 uint32_t k1, uint32_t E, uint32_t nr, uint32_t S,
+                 const uint8_t * __restrict__ dig,
+                 const uint8_t * __restrict__ sgn,
+                 int32_t * __restrict__ state, const int32_t * __restrict__ idp,
+                 int32_t * __restrict__ scr)
+{
+  constexpr size_t D = 1 << LG;
+  int32_t *s = scr + blockIdx.x * NT_SCR (D), *acc = s + 12 * D;
+  for (uint32_t i = blockIdx.x; i < count; i += gridDim.x)
+    {
+      const uint32_t cv = mode == RS_CHAIN ? i : mode == RS_FILL ? i / K : i / E;
+      const int32_t *cc = cst + (size_t) cv * RC_COUNT * D;
+      const uint32_t *hc = chat + (size_t) cv * RH_COUNT * 4 * D;
+      const size_t wc = (size_t) cv * K * nw * 4;          /* numbers */
+      if (mode == RS_CHAIN)
+        {
+          uint32_t kstart;
+          if (k0 == 0)
+            {
+              nt_copy_pt<LG> (acc, cc + RC_PX * D);
+              nt_copy_pt<LG> (W + wc * D, acc);
+              kstart = 1;
+            }
+          else
+            {
+              nt_copy_pt<LG> (acc, W + (wc + (size_t) (k0 - 1) * nw * 4) * D);
+              kstart = k0;
+            }
+          const uint32_t iters = k1 > kstart ? (k1 - kstart) * w : 0;
+          for (uint32_t it = 0; it < iters; it++)
+            {
+              nt_add<LG> (c, acc, acc, acc, hc, s, 0, -1);
+              if ((it + 1) % w == 0)
+                nt_copy_pt<LG> (W + (wc + (size_t) (kstart + it / w) * nw * 4) * D,
+                                acc);
+            }
+        }
+      else if (mode == RS_FILL)
+        {
+          const int32_t *base = W + (size_t) i * nw * 4 * D;
+          for (uint32_t it = 0; it + 1 < nw; it++)
+            nt_add<LG> (c, W + ((size_t) i * nw + it + 1) * 4 * D,
+                        W + ((size_t) i * nw + it) * 4 * D, base, hc, s, 0,
+                        -1);
+        }
+      else
+        {
+          const uint32_t e = i % E;
+          const bool shared = e == nr * S;
+          const uint32_t r = shared ? 0 : e / S, pt = shared ? S : e % S;
+          int32_t *st = state + (((size_t) (cv * nr + r) * (S + 1) + pt) * 4) * D;
+          if (k0 == 0)
+            nt_copy_pt<LG> (st, idp);
+          for (uint32_t k = k0; k < k1; k++)
+            {
+              const uint32_t d = dig[(size_t) e * K + k];
+              if (d != 0)
+                nt_add<LG> (c, st, st,
+                            W + (wc + ((size_t) k * nw + d - 1) * 4) * D, hc,
+                            s, 0, -1);
+            }
+          if (k1 == K)
+            {
+              if (sgn[e])
+                {
+                  nm_neg<LG> (st, st);
+                  nm_neg<LG> (st + 3 * D, st + 3 * D);
+                }
+              if (shared)
+                for (uint32_t rr = 1; rr < nr; rr++)
+                  nt_copy_pt<LG> (state + (((size_t) (cv * nr + rr) * (S + 1) + S) * 4) * D,
+                                  st);
+            }
+        }
+    }
+}
+
+/* as rt_step_body */
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_step_kernel (const __grid_constant__ nm_ctx c, uint32_t ninst, uint32_t nr,
+                uint32_t S, int32_t * __restrict__ state,
+                const uint32_t * __restrict__ chat,
+                const int32_t * __restrict__ slots, uint64_t base,
+                uint32_t dF, uint32_t it0, uint32_t it1,
+                int32_t * __restrict__ num, int32_t * __restrict__ den,
+                int32_t * __restrict__ scr)
+{
+  constexpr size_t D = 1 << LG;
+  int32_t *s = scr + blockIdx.x * NT_SCR (D);
+  int32_t *u = s + 10 * D, *v = s + 11 * D, *dump = s + 12 * D;
+  for (uint32_t inst = blockIdx.x; inst < ninst; inst += gridDim.x)
+    {
+      const uint32_t cv = inst / nr, r = inst % nr;
+      const uint32_t *hc = chat + (size_t) cv * RH_COUNT * 4 * D;
+      int32_t *st = state + (size_t) inst * (S + 1) * 4 * D;
+      int64_t nlo = 0, nhi = 0;
+      if (slots == NULL)
+        {
+          int64_t lo = (int64_t) base - r, hi = (int64_t) base + dF - r;
+          nlo = lo > 0 ? (lo + nr - 1) / nr : 0;
+          nhi = hi > 0 ? (hi + nr - 1) / nr : 0;
+        }
+      for (uint32_t it = it0; it < it1; it++)
+        {
+          bool act;
+          int64_t slot;
+          if (slots != NULL)
+            {
+              act = true;
+              slot = slots[(size_t) it * nr + r];
+            }
+          else
+            {
+              int64_t nn = nlo + it;
+              act = nn < nhi;
+              slot = (int64_t) r + nn * nr - (int64_t) base;
+            }
+          if (!act)
+            break;                /* no more steps for this instance */
+          const bool emit = slot >= 0 && slot < dF;
+          const size_t o = ((size_t) cv * dF + (emit ? slot : 0)) * D;
+          /* numerator (3 + A) Z + (3 - A) Y, denominator 3g (Z - Y) */
+          if (emit)
+            {
+              nm_mul<LG> (c, u, st + 2 * D, hc + RH_C1 * 4 * D);
+              nm_mul<LG> (c, v, st + D, hc + RH_C2 * 4 * D);
+              nm_add<LG> (num + o, u, v);
+              nm_sub<LG> (u, st + 2 * D, st + D);
+              nm_mul<LG> (c, den + o, u, hc + RH_C3 * 4 * D);
+            }
+          for (uint32_t k = 0; k < S; k++)
+            nt_add<LG> (c, st + (size_t) k * 4 * D, st + (size_t) k * 4 * D,
+                        st + (size_t) (k + 1) * 4 * D, hc, s, k & 1,
+                        k > 0 ? (int) ((k - 1) & 1) : -1);
+        }
+      (void) dump;
+    }
+}
+
+/* as rt_vec_body (OUT: D words per number for RV_UP, NL limbs for
+   RV_FINAL) */
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_vec_kernel (const __grid_constant__ nm_ctx c, int mode, uint64_t count,
+               const int32_t * __restrict__ a, uint64_t na,
+               int32_t * __restrict__ b, uint32_t * __restrict__ out,
+               uint32_t nl, int32_t * __restrict__ scr)
+{
+  constexpr size_t D = 1 << LG;
+  int32_t *s = scr + blockIdx.x * NT_SCR (D);
+  uint32_t *h = (uint32_t *) (s + NT_NUMS * D);
+  for (uint64_t i = blockIdx.x; i < count; i += gridDim.x)
+    {
+      if (mode == RV_UP)
+        {
+          int32_t *o = (int32_t *) out + i * D;
+          if (2 * i + 1 < na)
+            {
+              nm_hat<LG> (c, h, a + (2 * i + 1) * D);
+              nm_mul<LG> (c, o, a + 2 * i * D, h);
+            }
+          else
+            nm_copy<LG> (o, a + 2 * i * D);
+        }
+      else if (mode == RV_DOWN)
+        {
+          nm_hat<LG> (c, h, a + i * D);
+          if (2 * i + 1 < na)
+            nm_mul<LG> (c, s, b + (2 * i + 1) * D, h);
+          else
+            nm_copy<LG> (s, a + i * D);
+          nm_mul<LG> (c, s + D, b + 2 * i * D, h);
+          nm_copy<LG> (b + 2 * i * D, s);
+          if (2 * i + 1 < na)
+            nm_copy<LG> (b + (2 * i + 1) * D, s + D);
+        }
+      else
+        {
+          nm_hat<LG> (c, h, b + i * D);
+          nm_mul<LG> (c, s, a + i * D, h);
+          nm_mul<LG> (c, s, s, c.hone);             /* out of Montgomery form */
+          int32_t x[8];
+          nm_load<LG> (x, s);
+          nm_to_limbs<LG> (c, out + i * nl, nl, x);
+        }
+    }
+}
+
+/* The Z/N tree and transposed-evaluation levels (as rt_tree_body and
+   rt_mp_body) for degrees up to NT_ZMAX: per node, the hats of its
+   numbers, the b's (tree) or children (mp) put in Montgomery form first
+   (times R^2 / R), so that each output coefficient is one sum of
+   pointwise products in the transform domain and one reduction:
+   about 12 (tree) or 18 (mp) transforms per coefficient whatever D.
+   Scratch per block: NT_ZSCR words. */
+#define NT_ZMAX 16
+#define NT_ZSCR(D) ((size_t) (4 * 4 * NT_ZMAX + 3) * (D))
+
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_tree_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t d,
+                const uint32_t * __restrict__ in, uint32_t * __restrict__ out,
+                uint32_t nl, int32_t * __restrict__ scr)
+{
+  constexpr size_t D = 1 << LG;
+  int32_t *x = scr + blockIdx.x * NT_ZSCR (D), *y = x + D, *z = y + D;
+  uint32_t *ha = (uint32_t *) (z + D), *hb = ha + (size_t) d * 4 * D;
+  const uint64_t pairs = count / (2 * d);
+  for (uint64_t pr = blockIdx.x; pr < pairs; pr += gridDim.x)
+    {
+      const uint32_t *A = in + pr * 2 * d * nl, *Bp = A + (size_t) d * nl;
+      for (uint32_t i = 0; i < d; i++)
+        {
+          nm_from_limbs<LG> (c, x, A + (size_t) i * nl, nl);
+          nm_hat<LG> (c, ha + (size_t) i * 4 * D, x);
+          nm_from_limbs<LG> (c, x, Bp + (size_t) i * nl, nl);
+          nm_mul<LG> (c, x, x, c.hR2);
+          nm_hat<LG> (c, hb + (size_t) i * 4 * D, x);
+        }
+      for (uint32_t k = 0; k < 2 * d; k++)
+        {
+          uint32_t acc[2][2][8];
+          nm_acc_clear<LG> (acc);
+          for (uint32_t i = k >= d ? k - d + 1 : 0; i < d && i <= k; i++)
+            nm_acc_add<LG> (c, acc, ha + (size_t) i * 4 * D,
+                            hb + (size_t) (k - i) * 4 * D);
+          nm_acc_redc<LG> (c, z, acc);
+          /* + a_(k-d) + b_(k-d) */
+          if (k >= d)
+            {
+              nm_from_limbs<LG> (c, x, A + (size_t) (k - d) * nl, nl);
+              nm_from_limbs<LG> (c, y, Bp + (size_t) (k - d) * nl, nl);
+              nm_add<LG> (z, z, x);
+              nm_add<LG> (z, z, y);
+            }
+          int32_t v[8];
+          nm_load<LG> (v, z);
+          nm_to_limbs<LG> (c, out + (pr * 2 * d + k) * nl, nl, v);
+        }
+    }
+}
+
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_mp_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t half,
+              const uint32_t * __restrict__ tv,
+              const uint32_t * __restrict__ tree, uint32_t * __restrict__ out,
+              uint32_t nl, int32_t * __restrict__ scr)
+{
+  constexpr size_t D = 1 << LG;
+  int32_t *x = scr + blockIdx.x * NT_ZSCR (D), *z = x + 2 * D;
+  /* hats: the 2 half - 1 values used, then the children L, R */
+  uint32_t *ht = (uint32_t *) (z + D), *hl = ht + (size_t) 2 * half * 4 * D;
+  uint32_t *hr = hl + (size_t) half * 4 * D;
+  const uint64_t k = 2 * (uint64_t) half, nodes = count / k;
+  for (uint64_t nd = blockIdx.x; nd < nodes; nd += gridDim.x)
+    {
+      const uint32_t *T = tv + nd * k * nl, *Lc = tree + nd * k * nl;
+      const uint32_t *Rc = Lc + (size_t) half * nl;
+      for (uint32_t m = 0; m + 1 < k; m++)
+        {
+          nm_from_limbs<LG> (c, x, T + (size_t) m * nl, nl);
+          nm_hat<LG> (c, ht + (size_t) m * 4 * D, x);
+        }
+      for (uint32_t j = 0; j < half; j++)
+        {
+          nm_from_limbs<LG> (c, x, Lc + (size_t) j * nl, nl);
+          nm_mul<LG> (c, x, x, c.hR2);
+          nm_hat<LG> (c, hl + (size_t) j * 4 * D, x);
+          nm_from_limbs<LG> (c, x, Rc + (size_t) j * nl, nl);
+          nm_mul<LG> (c, x, x, c.hR2);
+          nm_hat<LG> (c, hr + (size_t) j * 4 * D, x);
+        }
+      for (uint32_t r = 0; r < k; r++)
+        {
+          const uint32_t i = r % half;
+          const uint32_t *hc = r < half ? hr : hl;
+          uint32_t acc[2][2][8];
+          nm_acc_clear<LG> (acc);
+          for (uint32_t j = 0; j < half; j++)
+            nm_acc_add<LG> (c, acc, hc + (size_t) j * 4 * D,
+                            ht + (size_t) (i + j) * 4 * D);
+          nm_acc_redc<LG> (c, z, acc);
+          nm_from_limbs<LG> (c, x, T + (size_t) (half + i) * nl, nl);
+          nm_add<LG> (z, z, x);
+          int32_t v[8];
+          nm_load<LG> (v, z);
+          nm_to_limbs<LG> (c, out + (nd * k + r) * nl, nl, v);
+        }
+    }
+}
+
+/* the hats of each curve's a, d, C1, C2, C3 (numbers RC_A .. RC_C3) */
+template<int LG>
+__global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
+nt_chat_kernel (const __grid_constant__ nm_ctx c, uint32_t count,
+                const int32_t * __restrict__ cst, uint32_t * __restrict__ chat)
+{
+  constexpr size_t D = 1 << LG;
+  for (uint32_t i = blockIdx.x; i < count; i += gridDim.x)
+    {
+      const uint32_t cv = i / RH_COUNT, k = i % RH_COUNT;
+      nm_hat<LG> (c, chat + ((size_t) cv * RH_COUNT + k) * 4 * D,
+                  cst + ((size_t) cv * RC_COUNT + k) * D);
+    }
+}
+
 /* ---- kernel table ------------------------------------------------------ */
 
 typedef void (*rt_setup_fn) (uint32_t, int, uint32_t, const uint32_t *,
@@ -868,7 +1279,8 @@ struct rt_kernels {
    (at 1024 bits 2 x 17 needs 255 registers and spills in the step kernel,
    1.6 times slower than 4 x 9 on an A10), L <= 17 for the Z/N tree and
    middle product kernels (2 x 17 there is faster than 4 x 9).  Past the
-   budget (N above 32 x 12 or 128 x 12 limbs), any L. */
+   budget (N above 32 x 12 or 128 x 12 limbs), any L: for the roots first
+   within a warp (rt_shape). */
 static const uint32_t rt_Ls[] = { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 24 };
 
 /* ZN: only the Z/N kernels (tree and mp) */
@@ -936,16 +1348,26 @@ rt_kset_for (uint32_t tpi, uint32_t L, bool zn)
   return (zn ? ks->tree != NULL : ks->setup != NULL) ? ks : NULL;
 }
 
+/* Passes: for the roots, first within a warp and the budget; then the
+   fewest limbs within a warp (any L) or within the budget (any group),
+   ties going to fewer threads; then anything.  The second pass takes
+   32 x 16 over 64 x 8 (385 to 512 limbs, from 12284 bits), 32 x 17 over
+   64 x 9 (513 to 544) and 32 x 24 over 64 x 12 (577 to 768), which make
+   stage 2 13-31% faster on an A10 (shared memory between the warps of a
+   wide group costs more than limbs past the budget), but not 32 x 24 over
+   64 x 9 (545 to 576 limbs).  The Z/N kernels: within the budget, then
+   anything. */
 static bool
 rt_shape (uint32_t nlimbs, uint32_t *tpi, uint32_t *L, bool zn = false)
 {
   const uint32_t lmax = zn ? 17 : 12;
-  for (int pass = 0; pass < 2; pass++)
+  for (int pass = zn ? 1 : 0; pass < 3; pass++)
     {
       uint32_t best = 0;
-      for (uint32_t t = 2; t <= 128; t *= 2)
+      for (uint32_t t = 2; t <= (pass == 0 ? 32u : 128u); t *= 2)
         for (uint32_t l : rt_Ls)
-          if (l * t >= nlimbs && (pass == 1 || l <= lmax)
+          if (l * t >= nlimbs
+              && (pass == 2 || l <= lmax || (pass == 1 && !zn && t <= 32))
               && rt_kset_for (t, l, zn) != NULL
               && (best == 0 || l * t < best))
             {
@@ -1045,7 +1467,117 @@ struct gpu_roots {
   rt_set F, G;
   uint64_t gblock;        /* the next block of G */
   cudaStream_t stream;    /* for everything but gpu_roots_tree, _mp */
+  struct rt_ntt *nt;      /* the NTT backend for the curve arithmetic, or
+                             NULL (then n is TPI L limbs; else n = D) */
+  struct rt_ntt *zt;      /* the NTT tables for the Z/N levels, or NULL
+                             (may be nt) */
 };
+
+/* the NTT backend's tables and scratch */
+struct rt_ntt {
+  nm_host h;
+  uint32_t D, TPG, slots;   /* slots: blocks per launch (resident ones) */
+  size_t smem;
+  uint32_t *d_chat;         /* per curve the hats RH_* */
+  int32_t *d_id;            /* the identity point */
+  int32_t *d_scr;           /* slots NT_SCR (D) words */
+  uint32_t zslots;          /* blocks of the Z/N tree and mp kernels */
+  int32_t *d_zscr;          /* their scratch (zslots NT_ZSCR (D)), or NULL
+                               until first used */
+};
+
+/* launch KERN<lg> on min (COUNT, CAP) blocks (each looping over its
+   share of the COUNT units) on stream ST */
+#define NT_RUNC(NT, KERN, COUNT, CAP, ST, ...) do {                          \
+    const rt_ntt *nt_ = (NT);                                                 \
+    const uint32_t g_ = (uint32_t) std::min<uint64_t> ((COUNT), (CAP));       \
+    if (g_ > 0)                                                               \
+      switch (nt_->h.c.lg)                                                    \
+        {                                                                     \
+        case 8: KERN<8><<<g_, 32, nt_->smem, (ST)>>> (nt_->h.c, __VA_ARGS__); break; \
+        case 9: KERN<9><<<g_, 64, nt_->smem, (ST)>>> (nt_->h.c, __VA_ARGS__); break; \
+        case 10: KERN<10><<<g_, 128, nt_->smem, (ST)>>> (nt_->h.c, __VA_ARGS__); break; \
+        case 11: KERN<11><<<g_, 256, nt_->smem, (ST)>>> (nt_->h.c, __VA_ARGS__); break; \
+        case 12: KERN<12><<<g_, 512, nt_->smem, (ST)>>> (nt_->h.c, __VA_ARGS__); break; \
+        }                                                                     \
+    CUDA_CHECK (cudaGetLastError ());                                         \
+  } while (0)
+#define NT_RUN(G, KERN, COUNT, ...)                                           \
+  NT_RUNC ((G)->nt, KERN, COUNT, (G)->nt->slots, (G)->stream, __VA_ARGS__)
+
+template<int LG>
+static uint32_t
+nt_slots (size_t smem)
+{
+  int dev, sm, b = 0;
+  CUDA_CHECK (cudaGetDevice (&dev));
+  CUDA_CHECK (cudaDeviceGetAttribute (&sm, cudaDevAttrMultiProcessorCount,
+                                      dev));
+  CUDA_CHECK (cudaOccupancyMaxActiveBlocksPerMultiprocessor (
+      &b, nt_step_kernel<LG>, (1 << LG) / 8, smem));
+  return (uint32_t) std::max (1, b) * sm;
+}
+
+/* The NTT tables for N with a transform length of at least 2^LGMIN, or
+   NULL (N too large, or sharing a factor with B^D - 1 for every b) */
+static rt_ntt *
+rt_ntt_create (const mpz_t N, int lgmin)
+{
+  int lg, b;
+  if (!nm_shape (mpz_sizeinbase (N, 2), lgmin, NM_MAX_LG, &lg, &b))
+    return NULL;
+  rt_ntt *nt = new rt_ntt;
+  bool ok = false;
+  for (; b <= NM_BMAX (lg) && !ok; b++)
+    ok = nm_ctx_create (nt->h, N, lg, b);
+  if (!ok)
+    {
+      delete nt;
+      return NULL;
+    }
+  nt->D = 1u << lg;
+  nt->TPG = nt->D / 8;
+  nt->smem = nm_smem_bytes (lg);
+  switch (lg)
+    {
+    case 8: nt->slots = nt_slots<8> (nt->smem); break;
+    case 9: nt->slots = nt_slots<9> (nt->smem); break;
+    case 10: nt->slots = nt_slots<10> (nt->smem); break;
+    case 11: nt->slots = nt_slots<11> (nt->smem); break;
+    default: nt->slots = nt_slots<12> (nt->smem); break;
+    }
+  nt->d_chat = NULL;
+  /* the identity (0 : 1 : 1 : 0): R mod N for 1 */
+  std::vector<int32_t> id ((size_t) 4 * nt->D, 0), one;
+  nm_digits (one, nt->h.R, nt->D, nt->h.c.b);
+  std::copy (one.begin (), one.end (), id.begin () + nt->D);
+  std::copy (one.begin (), one.end (), id.begin () + 2 * nt->D);
+  CUDA_CHECK (cudaMalloc ((void **) &nt->d_id, id.size () * 4));
+  CUDA_CHECK (cudaMemcpy (nt->d_id, id.data (), id.size () * 4,
+                          cudaMemcpyHostToDevice));
+  CUDA_CHECK (cudaMalloc ((void **) &nt->d_scr,
+                          (size_t) nt->slots * NT_SCR (nt->D) * 4));
+  nt->zslots = std::max (1u, nt->slots / 2);
+  nt->d_zscr = NULL;
+  return nt;
+}
+
+static void rt_ntt_zscr (rt_ntt *nt);
+
+static void
+rt_ntt_destroy (rt_ntt *nt)
+{
+  if (nt == NULL)
+    return;
+  if (nt->d_chat)
+    CUDA_CHECK (cudaFree (nt->d_chat));
+  CUDA_CHECK (cudaFree (nt->d_id));
+  CUDA_CHECK (cudaFree (nt->d_scr));
+  if (nt->d_zscr)
+    CUDA_CHECK (cudaFree (nt->d_zscr));
+  nm_ctx_free (nt->h);
+  delete nt;
+}
 
 static unsigned long
 rt_gcd (unsigned long a, unsigned long b)
@@ -1175,6 +1707,8 @@ rt_nr_target (const gpu_roots *G, double roots, double kbits)
   env = getenv ("GMPECM_ROOTS_FILL");
   const double per_sm = env != NULL && atoi (env) > 0 ? atoi (env) : 256;
   double fill = sm * per_sm / ((double) G->tpi * G->C);
+  if (G->nt != NULL)        /* one block per instance: twice the slots */
+    fill = 2.0 * G->nt->slots / G->C;
   double bal = roots / std::max (1.0, kbits / 4);
   double nr = std::min (fill, bal);
   return nr < 1 ? 1 : (uint32_t) std::min (nr, 65536.0);
@@ -1192,11 +1726,40 @@ gpu_roots_max_bits (void)
   return 32 * nmax - GPU_SPARE_BITS;
 }
 
+size_t
+gpu_roots_words (const mpz_t N)
+{
+  const size_t bits = mpz_sizeinbase (N, 2);
+  size_t w = (bits + GPU_SPARE_BITS + 31) / 32 + 32;
+  int lg, b;
+  if (bits >= 12000 && nm_shape (bits, NM_MIN_LG, NM_MAX_LG, &lg, &b))
+    w = std::max (w, (size_t) 1 << lg);
+  return w;
+}
+
+size_t
+gpu_roots_scratch_bytes (const mpz_t N)
+{
+  const size_t bits = mpz_sizeinbase (N, 2);
+  int lg, b;
+  if (bits < 12000 || !nm_shape (bits, NM_MIN_LG, NM_MAX_LG, &lg, &b))
+    return 0;
+  int dev, sm;
+  CUDA_CHECK (cudaGetDevice (&dev));
+  CUDA_CHECK (cudaDeviceGetAttribute (&sm, cudaDevAttrMultiProcessorCount,
+                                      dev));
+  /* at most 1024 threads of D / 8 per SM, half of them for the Z/N
+     levels */
+  return (size_t) sm * (8192 >> lg)
+         * (NT_SCR ((size_t) 1 << lg) + NT_ZSCR ((size_t) 1 << lg) / 2) * 4;
+}
+
 static void
 rt_set_alloc (gpu_roots *G, rt_set &s)
 {
   s.E = s.nr * std::abs (G->S) + 1;
-  s.pinst = (uint32_t) rt_padded (G, (uint64_t) G->C * s.nr);
+  s.pinst = G->nt != NULL ? G->C * s.nr
+            : (uint32_t) rt_padded (G, (uint64_t) G->C * s.nr);
   size_t words = (size_t) (std::abs (G->S) + 1) * 4 * G->n * s.pinst;
   CUDA_CHECK (cudaMalloc ((void **) &s.d_state, words * 4));
   CUDA_CHECK (cudaMemset (s.d_state, 0, words * 4));
@@ -1328,6 +1891,165 @@ rt_digits (gpu_roots *G, rt_set &s)
   s.co = NULL;
 }
 
+/* seconds per unit of KERNEL work, best of two runs after a warm-up */
+template<class F>
+static double
+rt_time (F launch, double units)
+{
+  cudaEvent_t e0, e1;
+  CUDA_CHECK (cudaEventCreate (&e0));
+  CUDA_CHECK (cudaEventCreate (&e1));
+  double best = 1e30;
+  for (int r = 0; r < 3; r++)
+    {
+      CUDA_CHECK (cudaEventRecord (e0, 0));
+      launch ();
+      CUDA_CHECK (cudaEventRecord (e1, 0));
+      CUDA_CHECK (cudaEventSynchronize (e1));
+      float ms;
+      CUDA_CHECK (cudaEventElapsedTime (&ms, e0, e1));
+      if (r > 0)
+        best = std::min (best, ms * 1e-3 / units);
+    }
+  CUDA_CHECK (cudaEventDestroy (e0));
+  CUDA_CHECK (cudaEventDestroy (e1));
+  return best;
+}
+
+/* seconds per product of the vec kernel's RV_UP (generic products: the
+   NTT transforms both operands) on zeros (no data-dependent work), on
+   the roots' schoolbook shape of G or, with NT, the NTT */
+static double
+rt_time_up (gpu_roots *G, rt_ntt *nt)
+{
+  const uint64_t count = 1024;
+  const size_t words = nt != NULL ? nt->D : G->n;
+  uint32_t *a, *o;
+  CUDA_CHECK (cudaMalloc ((void **) &a, 2 * count * words * 4));
+  CUDA_CHECK (cudaMalloc ((void **) &o, count * words * 4));
+  CUDA_CHECK (cudaMemset (a, 0, 2 * count * words * 4));
+  const double t = rt_time ([&] {
+      if (nt != NULL)
+        NT_RUNC (nt, nt_vec_kernel, count, nt->slots, (cudaStream_t) 0,
+                 RV_UP, count, (const int32_t *) a, 2 * count,
+                 (int32_t *) NULL, o, 0u, nt->d_scr);
+      else
+        {
+          G->k->vec<<<rt_blocks (G, count), GPU_TPB>>> (
+              G->tpi, RV_UP, count, a, 2 * count, NULL, o, 0, G->d_N,
+              G->d_one, G->np0);
+          CUDA_CHECK (cudaGetLastError ());
+        }
+    }, (double) count);
+  CUDA_CHECK (cudaFree (a));
+  CUDA_CHECK (cudaFree (o));
+  return t;
+}
+
+/* seconds per output coefficient of a Z/N tree level of degree 8 (zeros),
+   with the Z/N shape of G or, with NT, the NTT */
+static double
+rt_time_tree (gpu_roots *G, rt_ntt *nt)
+{
+  const uint32_t d = 8;
+  const uint64_t count = (uint64_t) 2 * d * (nt != NULL ? nt->zslots : 32);
+  uint32_t *a, *o;
+  CUDA_CHECK (cudaMalloc ((void **) &a, count * G->nl * 4));
+  CUDA_CHECK (cudaMalloc ((void **) &o, count * G->nl * 4));
+  CUDA_CHECK (cudaMemset (a, 0, count * G->nl * 4));
+  if (nt != NULL)
+    rt_ntt_zscr (nt);
+  const double t = rt_time ([&] {
+      if (nt != NULL)
+        NT_RUNC (nt, nt_tree_kernel, count / (2 * d), nt->zslots,
+                 (cudaStream_t) 0, count, d, a, o, (uint32_t) G->nl,
+                 nt->d_zscr);
+      else
+        {
+          const uint64_t per = GPU_TPB / G->ztpi;
+          G->zk->tree<<<(unsigned) ((count + per - 1) / per), GPU_TPB>>> (
+              G->ztpi, count, d, a, o, G->nl, G->d_zN, G->d_zR2, G->np0);
+          CUDA_CHECK (cudaGetLastError ());
+        }
+    }, (double) count);
+  CUDA_CHECK (cudaFree (a));
+  CUDA_CHECK (cudaFree (o));
+  return t;
+}
+
+/* (limbs, NTT for the roots, NTT for the Z/N levels) for the sizes timed
+   so far */
+struct rt_choice { uint32_t need; bool roots, zn; };
+static std::vector<rt_choice> rt_choices;
+
+/* The NTT tables for G's N into G->nt (the roots' curve arithmetic) and
+   G->zt (the Z/N tree and evaluation levels), each or both NULL for the
+   schoolbook kernels.  GMPECM_ROOTS_NTT=1 forces the NTT for both (at any
+   size it takes), =0 rules it out; GMPECM_ROOTS_ZNTT does the same for
+   the Z/N levels alone.  Otherwise, from 12000 bits on (the roots only
+   when no shape was forced), each part is timed both ways once per size
+   (printed with GMPECM_ROOTS_PROF): the roots on generic products, where
+   the NTT may be up to 1.3 times slower (an addition reuses transforms,
+   the step kernels keep more state than these products: 1.4 to 1.8 times
+   faster in the roots than timed at 26000 bits on an A10), the Z/N levels
+   on a level of degree 8. */
+static void
+rt_pick_ntt (gpu_roots *G, const mpz_t N, uint32_t need, bool forced)
+{
+  const char *er = getenv ("GMPECM_ROOTS_NTT"), *ez = getenv ("GMPECM_ROOTS_ZNTT");
+  const int fr = er != NULL && *er != '\0' ? atoi (er) : -1;
+  const int fz = ez != NULL && *ez != '\0' ? atoi (ez) : fr;
+  const bool big = mpz_sizeinbase (N, 2) >= 12000;
+  bool want_r = fr == 1 || (fr < 0 && big && !forced);
+  bool want_z = fz == 1 || (fz < 0 && big);
+  G->nt = G->zt = NULL;
+  if (!want_r && !want_z)
+    return;
+  rt_ntt *nt = rt_ntt_create (N, NM_MIN_LG);
+  if (nt == NULL)
+    return;
+  if ((want_r && fr < 0) || (want_z && fz < 0))
+    {
+      const rt_choice *ch = NULL;
+      for (const rt_choice &c : rt_choices)
+        if (c.need == need)
+          ch = &c;
+      rt_choice c = { need, true, true };
+      if (ch != NULL)
+        c = *ch;
+      else
+        {
+          const double rn = rt_time_up (G, nt), rs = rt_time_up (G, NULL);
+          const double zn = rt_time_tree (G, nt), zs = rt_time_tree (G, NULL);
+          c.roots = rn < 1.3 * rs;
+          c.zn = zn < zs;
+          rt_choices.push_back (c);
+          if (G->verbose || getenv ("GMPECM_ROOTS_PROF") != NULL)
+            printf ("GPU roots: NTT d = %u, b = %d against schoolbook: "
+                    "products %.2f us (%u x %u: %.2f), Z/N level %.2f us "
+                    "(%u x %u: %.2f): roots %s, Z/N %s\n", nt->D, nt->h.c.b,
+                    rn * 1e6, G->tpi, G->L, rs * 1e6, zn * 1e6, G->ztpi,
+                    G->zL, zs * 1e6, c.roots ? "NTT" : "schoolbook",
+                    c.zn ? "NTT" : "schoolbook");
+        }
+      if (fr < 0)
+        want_r = want_r && c.roots;
+      if (fz < 0)
+        want_z = want_z && c.zn;
+    }
+  if (!want_r && !want_z)
+    {
+      rt_ntt_destroy (nt);
+      return;
+    }
+  G->nt = want_r ? nt : NULL;
+  G->zt = want_z ? nt : NULL;
+  /* the Z/N levels' scratch now, not at their first use: by then the
+     stage 2 driver has given the free memory to the polynomial work */
+  if (want_z)
+    rt_ntt_zscr (nt);
+}
+
 gpu_roots *
 gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
                   unsigned long d1, unsigned long d2, const mpz_t i0,
@@ -1335,6 +2057,7 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
                   int verbose)
 {
   const uint32_t need = (mpz_sizeinbase (N, 2) + GPU_SPARE_BITS + 31) / 32;
+  const bool forced = tpi != 0 || getenv ("GMPECM_ROOTS_SHAPE") != NULL;
   if (tpi == 0 && getenv ("GMPECM_ROOTS_SHAPE") != NULL)
     sscanf (getenv ("GMPECM_ROOTS_SHAPE"), "%u,%u", &tpi, &L);
   if (tpi == 0 && !rt_shape (need, &tpi, &L))
@@ -1360,6 +2083,7 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
   G->verbose = verbose;
   G->gblock = 0;
   G->stream = 0;
+  G->nt = G->zt = NULL;
   mpz_inits (G->N, G->R, G->R2, NULL);
   mpz_set (G->N, N);
   mpz_setbit (G->R, 32 * (size_t) G->n);
@@ -1399,6 +2123,17 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
     mpz_clear (r);
   }
 
+  /* the NTT backend: numbers of D words, R = B^D - 1 */
+  rt_pick_ntt (G, N, need, forced);
+  if (G->nt != NULL)
+    {
+      G->n = G->nt->D;
+      mpz_set (G->R, G->nt->h.R);
+      mpz_set (G->R2, G->nt->h.R2);
+      CUDA_CHECK (cudaMalloc ((void **) &G->nt->d_chat,
+                              (size_t) curves * RH_COUNT * 4 * G->n * 4));
+    }
+
   rt_plan_F (G, d1, d2);
   rt_plan_G (G, d1, d2, i0);
   rt_set_alloc (G, G->F);
@@ -1429,6 +2164,13 @@ gpu_roots_create (const mpz_t N, uint32_t tpi, uint32_t L, int S,
   CUDA_CHECK (cudaMalloc ((void **) &G->d_den, M * G->n * 4));
   CUDA_CHECK (cudaMalloc ((void **) &G->d_tree, (M + 64) * G->n * 4));
 
+  if (verbose && (G->nt != NULL || G->zt != NULL))
+    {
+      const rt_ntt *t = G->nt != NULL ? G->nt : G->zt;
+      printf ("GPU roots: NTT products (d = %u, b = %d, %u blocks) for%s%s\n",
+              t->D, t->h.c.b, t->slots, G->nt ? " the roots" : "",
+              G->zt ? " the Z/N levels" : "");
+    }
   if (verbose)
     printf ("GPU roots: %u curves, S = %d%s, F: %u progressions (stride "
             "%lu, %u steps), G: %u progressions (stride %lu), %u-bit "
@@ -1474,6 +2216,9 @@ gpu_roots_destroy (gpu_roots *G)
     }
   rt_set_free (G->F);
   rt_set_free (G->G);
+  rt_ntt_destroy (G->nt);
+  if (G->zt != G->nt)
+    rt_ntt_destroy (G->zt);
   CUDA_CHECK (cudaFree (G->d_N));
   CUDA_CHECK (cudaFree (G->d_one));
   CUDA_CHECK (cudaFree (G->d_R2));
@@ -1493,16 +2238,23 @@ static void
 rt_start_set (gpu_roots *G, rt_set &s)
 {
   const uint64_t count = (uint64_t) G->C * s.E;
-  const uint32_t Ts = s.pinst * G->tpi;
+  const uint32_t Ts = G->nt != NULL ? 0 : s.pinst * G->tpi;
   for (uint32_t k0 = 0; k0 < G->K; k0 += RT_SLICE)
     {
       uint32_t k1 = std::min (G->K, k0 + RT_SLICE);
       rtp_begin (G->stream);
-      G->k->setup<<<rt_blocks (G, count), GPU_TPB, 0, G->stream>>> (
-          G->tpi, RS_SCALAR, (uint32_t) count, G->d_cst, G->d_W, G->K, G->w,
-          G->nw, k0, k1, s.E, s.nr, G->S, s.d_dig, s.d_sgn, s.d_state, Ts,
-          G->d_N,
-          G->d_one, G->np0);
+      if (G->nt != NULL)
+        NT_RUN (G, nt_setup_kernel, count, RS_SCALAR, (uint32_t) count,
+                (const int32_t *) G->d_cst, G->nt->d_chat, (int32_t *) G->d_W,
+                G->K, G->w, G->nw, k0, k1, s.E, s.nr, (uint32_t) G->S,
+                s.d_dig, s.d_sgn, (int32_t *) s.d_state, G->nt->d_id,
+                G->nt->d_scr);
+      else
+        G->k->setup<<<rt_blocks (G, count), GPU_TPB, 0, G->stream>>> (
+            G->tpi, RS_SCALAR, (uint32_t) count, G->d_cst, G->d_W, G->K, G->w,
+            G->nw, k0, k1, s.E, s.nr, G->S, s.d_dig, s.d_sgn, s.d_state, Ts,
+            G->d_N,
+            G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
       rtp_end (G->stream, RP_SCALAR);
     }
@@ -1554,7 +2306,15 @@ gpu_roots_curves (gpu_roots *G, mpz_t *A, mpz_t *x, mpz_t f, int *curve)
         {
           mpz_mul (c[i], c[i], G->R);
           mpz_mod (c[i], c[i], G->N);
-          gpu_to_limbs (&h[((size_t) cv * RC_COUNT + i) * n], n, c[i]);
+          uint32_t *hp = &h[((size_t) cv * RC_COUNT + i) * n];
+          if (G->nt != NULL)
+            {
+              std::vector<int32_t> dg;
+              nm_digits (dg, c[i], (int) n, G->nt->h.c.b);
+              memcpy (hp, dg.data (), (size_t) n * 4);
+            }
+          else
+            gpu_to_limbs (hp, n, c[i]);
         }
     }
   mpz_clears (g, u, inv, t, NULL);
@@ -1565,6 +2325,40 @@ gpu_roots_curves (gpu_roots *G, mpz_t *A, mpz_t *x, mpz_t f, int *curve)
 
   CUDA_CHECK (cudaMemcpyAsync (G->d_cst, h.data (), h.size () * 4,
                                cudaMemcpyHostToDevice, G->stream));
+  if (G->nt != NULL)
+    {
+      const uint32_t cnt = G->C * RH_COUNT;
+      rtp_begin (G->stream);
+      NT_RUN (G, nt_chat_kernel, cnt, cnt, (const int32_t *) G->d_cst,
+              G->nt->d_chat);
+      rtp_end (G->stream, RP_CHAIN);
+      for (uint32_t k0 = 0; k0 < G->K; k0 += RT_SLICE)
+        {
+          uint32_t k1 = std::min (G->K, k0 + RT_SLICE);
+          rtp_begin (G->stream);
+          NT_RUN (G, nt_setup_kernel, G->C, RS_CHAIN, G->C,
+                  (const int32_t *) G->d_cst, G->nt->d_chat,
+                  (int32_t *) G->d_W, G->K, G->w, G->nw, k0, k1, 0u, 0u, 0u,
+                  (const uint8_t *) NULL, (const uint8_t *) NULL,
+                  (int32_t *) NULL, G->nt->d_id, G->nt->d_scr);
+          rtp_end (G->stream, RP_CHAIN);
+        }
+      if (G->nw > 1)
+        {
+          rtp_begin (G->stream);
+          NT_RUN (G, nt_setup_kernel, (uint64_t) G->C * G->K, RS_FILL,
+                  G->C * G->K, (const int32_t *) G->d_cst, G->nt->d_chat,
+                  (int32_t *) G->d_W, G->K, G->w, G->nw, 0u, 0u, 0u, 0u, 0u,
+                  (const uint8_t *) NULL, (const uint8_t *) NULL,
+                  (int32_t *) NULL, G->nt->d_id, G->nt->d_scr);
+          rtp_end (G->stream, RP_FILL);
+        }
+      rt_start_set (G, G->F);
+      rt_start_set (G, G->G);
+      G->gblock = 0;
+      CUDA_CHECK (cudaStreamSynchronize (G->stream));
+      return 0;
+    }
   for (uint32_t k0 = 0; k0 < G->K; k0 += RT_SLICE)
     {
       uint32_t k1 = std::min (G->K, k0 + RT_SLICE);
@@ -1606,9 +2400,13 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
     {
       uint64_t c = (cnt.back () + 1) / 2;
       rtp_begin (G->stream);
-      G->k->vec<<<rt_blocks (G, c), GPU_TPB, 0, G->stream>>> (
-          G->tpi, RV_UP, c, lev.back (), cnt.back (), NULL, p, 0, G->d_N,
-          G->d_one, G->np0);
+      if (G->nt != NULL)
+        NT_RUN (G, nt_vec_kernel, c, RV_UP, c, (const int32_t *) lev.back (),
+                cnt.back (), (int32_t *) NULL, p, 0u, G->nt->d_scr);
+      else
+        G->k->vec<<<rt_blocks (G, c), GPU_TPB, 0, G->stream>>> (
+            G->tpi, RV_UP, c, lev.back (), cnt.back (), NULL, p, 0, G->d_N,
+            G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
       rtp_end (G->stream, RP_UP);
       lev.push_back (p);
@@ -1622,7 +2420,13 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
   CUDA_CHECK (cudaStreamSynchronize (G->stream));
   mpz_t v, t;
   mpz_inits (v, t, NULL);
-  gpu_from_limbs (v, h.data (), n);
+  if (G->nt != NULL)
+    {
+      nm_value (v, (const int32_t *) h.data (), (int) n, G->nt->h.c.b);
+      mpz_mod (v, v, G->N);
+    }
+  else
+    gpu_from_limbs (v, h.data (), n);
   int found = 0;
   if (!mpz_invert (t, v, G->N))
     {
@@ -1639,7 +2443,11 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
           mpz_set_ui (v, 1);
           for (size_t i = 0; i < G->dF; i++)
             {
-              gpu_from_limbs (t, &all[((size_t) c * G->dF + i) * n], n);
+              if (G->nt != NULL)
+                nm_value (t, (const int32_t *) &all[((size_t) c * G->dF + i) * n],
+                          (int) n, G->nt->h.c.b);
+              else
+                gpu_from_limbs (t, &all[((size_t) c * G->dF + i) * n], n);
               mpz_mul (v, v, t);
               mpz_mod (v, v, G->N);
             }
@@ -1656,22 +2464,38 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
       /* inverse of v / R, in Montgomery form: R^2 / v */
       mpz_mul (t, t, G->R2);
       mpz_mod (t, t, G->N);
-      gpu_to_limbs (h.data (), n, t);
+      if (G->nt != NULL)
+        {
+          std::vector<int32_t> dg;
+          nm_digits (dg, t, (int) n, G->nt->h.c.b);
+          memcpy (h.data (), dg.data (), (size_t) n * 4);
+        }
+      else
+        gpu_to_limbs (h.data (), n, t);
       CUDA_CHECK (cudaMemcpyAsync (lev.back (), h.data (), n * 4,
                                    cudaMemcpyHostToDevice, G->stream));
       for (size_t l = lev.size () - 1; l > 0; l--)
         {
           rtp_begin (G->stream);
-          G->k->vec<<<rt_blocks (G, cnt[l]), GPU_TPB, 0, G->stream>>> (
-              G->tpi, RV_DOWN, cnt[l], lev[l], cnt[l - 1], lev[l - 1], NULL,
-              0, G->d_N, G->d_one, G->np0);
+          if (G->nt != NULL)
+            NT_RUN (G, nt_vec_kernel, cnt[l], RV_DOWN, cnt[l],
+                    (const int32_t *) lev[l], cnt[l - 1], (int32_t *) lev[l - 1],
+                    (uint32_t *) NULL, 0u, G->nt->d_scr);
+          else
+            G->k->vec<<<rt_blocks (G, cnt[l]), GPU_TPB, 0, G->stream>>> (
+                G->tpi, RV_DOWN, cnt[l], lev[l], cnt[l - 1], lev[l - 1], NULL,
+                0, G->d_N, G->d_one, G->np0);
           CUDA_CHECK (cudaGetLastError ());
           rtp_end (G->stream, RP_DOWN);
         }
       rtp_begin (G->stream);
-      G->k->vec<<<rt_blocks (G, M), GPU_TPB, 0, G->stream>>> (
-          G->tpi, RV_FINAL, M, G->d_num, M, G->d_den, out, G->nl, G->d_N,
-          G->d_one, G->np0);
+      if (G->nt != NULL)
+        NT_RUN (G, nt_vec_kernel, M, RV_FINAL, M, (const int32_t *) G->d_num,
+                M, (int32_t *) G->d_den, out, (uint32_t) G->nl, G->nt->d_scr);
+      else
+        G->k->vec<<<rt_blocks (G, M), GPU_TPB, 0, G->stream>>> (
+            G->tpi, RV_FINAL, M, G->d_num, M, G->d_den, out, G->nl, G->d_N,
+            G->d_one, G->np0);
       CUDA_CHECK (cudaGetLastError ());
       rtp_end (G->stream, RP_FINAL);
       CUDA_CHECK (cudaStreamSynchronize (G->stream));
@@ -1680,11 +2504,28 @@ rt_finish (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
   return found;
 }
 
+/* the Z/N levels' scratch, on first use */
+static void
+rt_ntt_zscr (rt_ntt *nt)
+{
+  if (nt->d_zscr == NULL)
+    CUDA_CHECK (cudaMalloc ((void **) &nt->d_zscr,
+                            (size_t) nt->zslots * NT_ZSCR (nt->D) * 4));
+}
+
 void
 gpu_roots_tree (void *ctx, uint32_t *out, const uint32_t *in, size_t count,
                 size_t d)
 {
   gpu_roots *G = (gpu_roots *) ctx;
+  if (G->zt != NULL && d <= NT_ZMAX)
+    {
+      rt_ntt_zscr (G->zt);
+      NT_RUNC (G->zt, nt_tree_kernel, count / (2 * d), G->zt->zslots,
+               (cudaStream_t) 0, (uint64_t) count, (uint32_t) d, in, out,
+               (uint32_t) G->nl, G->zt->d_zscr);
+      return;
+    }
   const uint64_t per = GPU_TPB / G->ztpi;
   G->zk->tree<<<(unsigned) ((count + per - 1) / per), GPU_TPB>>> (
       G->ztpi, count, (uint32_t) d, in, out, G->nl, G->d_zN, G->d_zR2,
@@ -1697,6 +2538,14 @@ gpu_roots_mp (void *ctx, uint32_t *out, const uint32_t *tv,
               const uint32_t *tree, size_t count, size_t half)
 {
   gpu_roots *G = (gpu_roots *) ctx;
+  if (G->zt != NULL && half <= NT_ZMAX)
+    {
+      rt_ntt_zscr (G->zt);
+      NT_RUNC (G->zt, nt_mp_kernel, count / (2 * half), G->zt->zslots,
+               (cudaStream_t) 0, (uint64_t) count, (uint32_t) half, tv, tree,
+               out, (uint32_t) G->nl, G->zt->d_zscr);
+      return;
+    }
   const uint64_t per = GPU_TPB / G->ztpi;
   G->zk->mp<<<(unsigned) ((count + per - 1) / per), GPU_TPB>>> (
       G->ztpi, count, (uint32_t) half, tv, tree, out, G->nl, G->d_zN,
@@ -1713,10 +2562,16 @@ gpu_roots_F (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
     {
       uint32_t i1 = std::min (s.steps, i0 + RT_SLICE);
       rtp_begin (G->stream);
-      G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
-          G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst,
-          s.d_slots, 0, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den,
-          G->d_N, G->np0);
+      if (G->nt != NULL)
+        NT_RUN (G, nt_step_kernel, ninst, (uint32_t) ninst, s.nr,
+                (uint32_t) G->S, (int32_t *) s.d_state, G->nt->d_chat,
+                s.d_slots, (uint64_t) 0, (uint32_t) G->dF, i0, i1,
+                (int32_t *) G->d_num, (int32_t *) G->d_den, G->nt->d_scr);
+      else
+        G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
+            G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst,
+            s.d_slots, 0, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den,
+            G->d_N, G->np0);
       CUDA_CHECK (cudaGetLastError ());
       rtp_end (G->stream, RP_STEP);
     }
@@ -1742,10 +2597,16 @@ gpu_roots_G (gpu_roots *G, uint32_t *out, mpz_t f, int *curve)
     {
       uint32_t i1 = std::min (its, i0 + RT_SLICE);
       rtp_begin (G->stream);
-      G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
-          G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst, NULL,
-          base, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den, G->d_N,
-          G->np0);
+      if (G->nt != NULL)
+        NT_RUN (G, nt_step_kernel, ninst, (uint32_t) ninst, s.nr,
+                (uint32_t) G->S, (int32_t *) s.d_state, G->nt->d_chat,
+                (const int32_t *) NULL, base, (uint32_t) G->dF, i0, i1,
+                (int32_t *) G->d_num, (int32_t *) G->d_den, G->nt->d_scr);
+      else
+        G->k->step<<<rt_blocks (G, ninst), GPU_TPB, 0, G->stream>>> (
+            G->tpi, (uint32_t) ninst, s.nr, G->S, s.d_state, G->d_cst, NULL,
+            base, (uint32_t) G->dF, i0, i1, G->d_num, G->d_den, G->d_N,
+            G->np0);
       CUDA_CHECK (cudaGetLastError ());
       rtp_end (G->stream, RP_STEP);
     }

@@ -114,7 +114,25 @@ void gpu_rns_conv_prep (gpu_rns *R, uint32_t *c, size_t sc, size_t o0,
    (the product is monic of degree 2D).  2D a power of 2, <= 2^K. */
 void gpu_rns_conv_monic (gpu_rns *R, uint32_t *c, size_t sc,
                          const uint32_t *a, size_t sa, const uint32_t *b,
-                         size_t sb, size_t d, int batch);
+                         size_t sb, size_t d, int batch,
+                         uint32_t *keepx = NULL, uint32_t *keepy = NULL);
+
+/* With KEEPX and KEEPY (BATCH P rows of 2D words each), gpu_rns_conv_monic
+   also leaves there the forward transforms of x^D + A and x^D + B.  For
+   each of NODES nodes j, items 2j and 2j + 1 (into C + i SC, OC <= D
+   entries each) are the first entries of the cyclic correlations of length
+   2D, sum_m a_m b_(i+m), of node j's B (its transforms in BPREP, from
+   gpu_rns_prep, one per node) with a = the D coefficients of the right
+   (item 2j) or the left (item 2j + 1) child, read from KEEPY or KEEPX of
+   the gpu_rns_conv_monic that made node j: no transform of the children
+   again. */
+void gpu_rns_corr_kept (gpu_rns *R, uint32_t *c, size_t sc, size_t oc,
+                        const uint32_t *bprep, const uint32_t *keepx,
+                        const uint32_t *keepy, size_t d, int nodes);
+
+/* Grow the scratch of the products to WORDS now (gpu_rns_scratch_words), so
+   that the memory left free stays free. */
+void gpu_rns_reserve (gpu_rns *R, size_t words);
 
 /* Product of polynomials over Z/N: C = A B, A of NA and B of NB
    coefficients (Z/N form, device memory), C of NA + NB - 1, for BATCH

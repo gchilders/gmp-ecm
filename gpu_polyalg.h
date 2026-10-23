@@ -63,6 +63,15 @@ void gpu_polyalg_lowmp (gpu_polyalg *A,
                                     const uint32_t *, size_t, size_t),
                         void *ctx, size_t hmax);
 
+/* Keep the transforms of the product trees made by gpu_poly_from_roots
+   (with a tree), as many levels as fit in BYTES of device memory,
+   allocated now, from the top, for gpu_poly_tpeval with that tree: it
+   then transforms only the values, not the children (a correlation with
+   the kept transforms).  After gpu_polyalg_lowmul and gpu_polyalg_lowmp:
+   no levels they do. */
+void gpu_polyalg_treecache (gpu_polyalg *A, size_t bytes);
+int gpu_polyalg_kept (const gpu_polyalg *A);   /* levels kept */
+
 /* F (n numbers) <- the low coefficients of prod (x + roots[i]), i < n;
    with TREE (l pointers to n numbers each), also the product tree. */
 void gpu_poly_from_roots (gpu_polyalg *A, uint32_t *F, uint32_t **tree,

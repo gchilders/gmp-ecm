@@ -129,12 +129,13 @@ s2p_mem (const mpz_t N, unsigned long dF, unsigned long B)
   const double n = (double) dF, l = s2p_lg (dF);
   const double nl = (double) ((mpz_sizeinbase (N, 2) + 4 + 31) / 32);
   const double P = (2 * 32 * nl + l + 1) / 29 + 4;   /* NTT primes */
+  const double rw = (double) gpu_roots_words (N);    /* roots' numbers */
   double curve = (l + 7) * n * nl * 4    /* tree, F, I, H, G, values, roots x2 */
                  + 12 * n * nl * 4       /* polyalg scratch */
                  + 11 * P * n * 4        /* RNS transforms and scratch */
-                 + 3 * n * (nl + 32) * 4 /* roots: numerators, inversions */
-                 + 1e5 * (nl + 32);      /* roots: fixed-base table */
-  return 1.25 * (B * curve + 64e6);
+                 + 3 * n * rw * 4        /* roots: numerators, inversions */
+                 + 1e5 * rw;             /* roots: fixed-base table, state */
+  return 1.25 * (B * curve + 64e6 + gpu_roots_scratch_bytes (N));
 }
 
 double
@@ -226,6 +227,22 @@ gpu_ecm_stage2_poly (mpz_t *xs, int *array_found, mpz_t *As, const mpz_t N,
   CUDA_CHECK (cudaMalloc ((void **) &d_V, bytes));
   for (uint32_t *&p : tree)
     CUDA_CHECK (cudaMalloc ((void **) &p, bytes));
+
+  /* Keep F's tree transforms for the transposed evaluation in what memory
+     is left (GMPECM_S2POLY_TREECACHE=0: none), after the largest scratch
+     space (a product of B pairs of length 2 dF: 4 B P dF words) and a
+     margin */
+  {
+    const char *env = getenv ("GMPECM_S2POLY_TREECACHE");
+    if (env == NULL || atoi (env) != 0)
+      {
+        gpu_rns_reserve (R, (size_t) 4 * B * gpu_rns_primes (R) * dF);
+        size_t free_mem, total_mem;
+        CUDA_CHECK (cudaMemGetInfo (&free_mem, &total_mem));
+        const size_t margin = total_mem / 20 + ((size_t) 256 << 20);
+        gpu_polyalg_treecache (PA, free_mem > margin ? free_mem - margin : 0);
+      }
+  }
 
   /* The roots of the next block of G are computed on their own stream
      while the polynomial work on the last ones runs (on stream 0): two
@@ -371,6 +388,9 @@ gpu_ecm_stage2_poly (mpz_t *xs, int *array_found, mpz_t *As, const mpz_t N,
   CUDA_CHECK (cudaEventRecord (stop));
   CUDA_CHECK (cudaEventSynchronize (stop));
   prof.print (curves);
+  if (prof.on)
+    printf ("GPU stage 2: F's tree transforms kept for %d levels\n",
+            gpu_polyalg_kept (PA));
   CUDA_CHECK (cudaEventElapsedTime (gputime, start, stop));
   CUDA_CHECK (cudaEventDestroy (start));
   CUDA_CHECK (cudaEventDestroy (stop));

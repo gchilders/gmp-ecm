@@ -39,7 +39,8 @@
 
    The curve arithmetic uses the schoolbook products of gpu_mont.cuh, TPI
    threads per curve (2 to 32, or wide groups of 64 or 128) with L limbs
-   each, up to gpu_roots_max_bits (). */
+   each, up to gpu_roots_max_bits (); or, for large N when they time
+   faster, the transform products of gpu_nmul.cuh (one block per instance). */
 
 #ifndef _GPU_ROOTS_H
 #define _GPU_ROOTS_H 1
@@ -52,6 +53,12 @@ struct gpu_roots;
 
 /* The largest N (in bits) with kernels */
 size_t gpu_roots_max_bits (void);
+
+/* For memory planning: device words per number (the larger of the
+   schoolbook and NTT backends' for N), and the fixed scratch of the NTT
+   backend in bytes (0 if it cannot be used) */
+size_t gpu_roots_words (const mpz_t N);
+size_t gpu_roots_scratch_bytes (const mpz_t N);
 
 /* For N, the kernel shape (TPI, L; 0, 0 to choose one), GMP-ECM's root
    parameters (S, d1, d2 with gcd (d1, d2) = 1, i0), dF and the number of

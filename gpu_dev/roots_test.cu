@@ -6,7 +6,10 @@
    gcc -O2 -I<build dir> -c roots_ref.c
    nvcc -O2 -arch=sm_86 -I.. -DGPU_ROOTS_MAX_L=6 \
      -o roots_test roots_test.cu roots_ref.o <build dir>/.libs/libecm.a -lgmp
-   ./roots_test */
+   ./roots_test [big] [ntt]
+   ntt: the same cases with the transform products (GMPECM_ROOTS_NTT=1,
+   transform length 2^8 at these sizes), then larger ones (4096 to 24000
+   bits, lengths 2^8 to 2^11). */
 
 #include "../gpu_roots.cu"
 #include <gmp.h>
@@ -80,7 +83,22 @@ test (const tcase &t, const char *nr)
   const int nl = (t.bits + 4 + 31) / 32;
   mpz_t N, i0, f;
   mpz_inits (N, i0, f, NULL);
-  /* a product of two primes, so that no factor turns up */
+  /* a product of two primes, so that no factor turns up; above 4096
+     bits (nextprime is slow there) an odd number without prime factors
+     below 10^5 */
+  if (t.bits > 4096)
+    for (;;)
+      {
+        mpz_urandomb (N, rs, t.bits);
+        mpz_setbit (N, t.bits - 1);
+        mpz_setbit (N, 0);
+        bool ok = true;
+        for (unsigned long p = 3; p < 100000 && ok; p += 2)
+          ok = !mpz_divisible_ui_p (N, p);
+        if (ok)
+          break;
+      }
+  else
   do
     {
       mpz_urandomb (N, rs, t.bits / 2);
@@ -197,12 +215,30 @@ main (int argc, char **argv)
     { 1000, -6, 2310, 13, "50", 240, 3, 3, 64, 6 },
     { 600, -12, 2310, 1, "-3", 240, 2, 2, 128, 6 },
   };
+  bool big = false, ntt = false;
+  for (int i = 1; i < argc; i++)
+    {
+      big |= strcmp (argv[i], "big") == 0;
+      ntt |= strcmp (argv[i], "ntt") == 0;
+    }
+  if (ntt)
+    setenv ("GMPECM_ROOTS_NTT", "1", 1);
   for (const tcase &t : cases)
     for (const char *nr : { (const char *) NULL, "1", "7" })
       test (t, nr);
+  if (ntt)
+    {
+      static const tcase large[] = {
+        { 4096, -6, 2310, 13, "7", 240, 2, 3, 0, 0 },
+        { 8192, 2, 2310, 13, "-3", 96, 2, 2, 0, 0 },
+        { 24000, -6, 210, 11, "50", 48, 2, 2, 0, 0 },
+      };
+      for (const tcase &t : large)
+        test (t, NULL);
+    }
   /* a bigger one for timing: 1018 bits, Dickson 12, dF = 2880, 32 curves,
      the shape chosen by gpu_roots */
-  if (argc > 1)
+  if (big)
     {
       tcase big = { 1018, -12, 30030, 17, "300", 2880, 4, 32, 0, 0 };
       test (big, NULL);
