@@ -351,8 +351,8 @@ gpu_ecm_stage2_poly (mpz_t *xs, int *array_found, mpz_t *As, const mpz_t N,
                        { return array_found[c] != ECM_NO_FACTOR_FOUND; }))
         continue;
 
-      /* the values H(-f_i) of every curve, and their products: the value
-         at f_0 (what GMP-ECM prints) first, as the product overwrites them */
+      /* the values H(-f_i) of every curve, and their products; the value
+         at f_0 is what GMP-ECM prints */
       gpu_poly_tpeval (PA, d_V, d_H, tree.data ());
       prof.mark (PH_EVAL);
       CUDA_CHECK (cudaMemcpy2D (h.data (), nl * 4, d_V, dF * nl * 4, nl * 4,

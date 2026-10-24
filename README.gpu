@@ -95,7 +95,7 @@ with the CPU above 1920 bits, give the CPU run "-ntt".
 
 Above 98300 bits, or without enough GPU memory, step 2 is a baby-step
 giant-step prime continuation on the GPU instead; "-gpubsgs" asks for it at
-any size.  It covers exactly the primes in (B2min, B2], at a cost linear in
+any size.  It covers exactly the primes in [B2min, B2], at a cost linear in
 B2, so its default B2 is 100 * B1, much smaller than the default for the FFT
 continuation.  For a given factor size the FFT continuation needs a half to
 two thirds as many curves (with its larger B2) for about the same time per
@@ -144,8 +144,8 @@ Inputs of any size up to 262140 bits run without recompiling.  Up to 98300
 bits, numbers are held as n 32-bit limbs spread over TPI threads per curve
 (L limbs each, n = TPI * L); kernels are compiled for every L, and TPI is
 chosen at run time: 1 to 32 (the threads of one warp) for inputs up to 24572
-bits, 64 or 128 (several warps of a block, trading limbs through shared
-memory) above.  For each input size GMP-ECM times the possible (TPI, L)
+bits (one thread per curve for inputs up to 892 bits), 64 or 128 (several
+warps of a block, trading limbs through shared memory) above.  For each input size GMP-ECM times the possible (TPI, L)
 shapes on the GPU and uses the fastest ("-v" prints the timings and the
 choice).  The input must be below 2^(32n - 4).
 

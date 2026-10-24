@@ -35,10 +35,11 @@ be tested one by one against the very functions they replace.
 32-bit limbs, the representation of the stage 1 plan where the root kernels need
 products (one-warp, wide or NTT kernels; see "Roots").
 
-**Polynomials over Z/N: RNS.** As `mpzspm_init` does: P primes p = c 2^K + 1 < 2^31
-(32-bit Shoup and Montgomery products without overflow tests), with 2^K the longest
-transform, and enough of them that prod p > 4 len (N sum p)^2, so that a convolution
-of length len of coefficients < N is exact.
+**Polynomials over Z/N: RNS.** As `mpzspm_init` does: P primes p = c 2^K + 1 < 2^30
+(32-bit Shoup and Montgomery products without overflow tests, values kept in
+[0, 2p)), with 2^K the longest transform, and enough of them that
+prod p > 2^(K+1) Bn^2 for inputs below Bn (2N in the contexts made for inputs below
+2N), so that a convolution of length up to 2^K is exact (gpu_rns.h).
 
 - **Limbs -> RNS:** for each coefficient and prime, sum_j a_j (2^(32j) mod p): a
   (coefficients x limbs) by (limbs x primes) matrix product, tiled through shared
@@ -51,7 +52,8 @@ of length len of coefficients < N is exact.
 - **NTT:** batched over (polynomials x primes), power-of-two lengths 2^6 to 2^K;
   lengths that fit shared memory in one pass per block (as gpu_ntt.cuh), longer
   ones as two passes through global memory (four-step), twiddle tables per prime.
-  Products longer than 2^K are split and summed in the transform domain.
+  No product is longer than 2^K: K is chosen for 2 dF (gpu_rns_lg), and dF is
+  lowered when there are not enough primes for it.
 - Pointwise products, sums and middle products (for the transposed evaluation)
   stay in RNS; conversions back to Z/N only where GMP-ECM's algorithms reduce mod N.
 

@@ -1166,6 +1166,13 @@ main (int argc, char *argv[])
      GPU, 2: stage 1 on the GPU and stage 2 on the CPU. */
   gpu_mode = use_gpu ? (cpu_stage2 ? 2 : gpu_bsgs ? 1 : 3) : 0;
   params->gpu = gpu_mode;
+  /* B1done-B1 means a stage 1 already done up to B1done: on the GPU that
+     needs its residues, from -resume */
+  if (use_gpu && resumefilename == NULL && !ECM_IS_DEFAULT_B1_DONE (B1done))
+    {
+      fprintf (stderr, "Error, with -gpu the B1done-B1 form needs -resume\n");
+      exit (EXIT_FAILURE);
+    }
   params->gpu_device = gpudevice; /* If WITH_GPU is not defined or    */
                                   /* use_gpu = 0, it has no meaning   */
   params->gpu_number_of_curves = gpucurves; /* If WITH_GPU is not defined or */

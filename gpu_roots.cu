@@ -1977,9 +1977,21 @@ rt_time_tree (gpu_roots *G, rt_ntt *nt)
   return t;
 }
 
-/* (limbs, NTT for the roots, NTT for the Z/N levels) for the sizes timed
-   so far */
-struct rt_choice { uint32_t need; bool roots, zn; };
+/* The choices timed so far (NTT for the roots, NTT for the Z/N levels),
+   by what they depend on: the transform length and digit size, and the
+   schoolbook shapes they were timed against (two N of the same limb count
+   can take different transform lengths, and a shape may be forced) */
+struct rt_choice {
+  uint32_t need;
+  int lg, b;
+  uint32_t tpi, L, ztpi, zL;
+  bool roots, zn;
+  bool same (const rt_choice &o) const
+  {
+    return need == o.need && lg == o.lg && b == o.b && tpi == o.tpi
+           && L == o.L && ztpi == o.ztpi && zL == o.zL;
+  }
+};
 static std::vector<rt_choice> rt_choices;
 
 /* The NTT tables for G's N into G->nt (the roots' curve arithmetic) and
@@ -2010,11 +2022,13 @@ rt_pick_ntt (gpu_roots *G, const mpz_t N, uint32_t need, bool forced)
     return;
   if ((want_r && fr < 0) || (want_z && fz < 0))
     {
+      const rt_choice key = { need, nt->h.c.lg, nt->h.c.b, G->tpi, G->L,
+                              G->ztpi, G->zL, true, true };
       const rt_choice *ch = NULL;
       for (const rt_choice &c : rt_choices)
-        if (c.need == need)
+        if (c.same (key))
           ch = &c;
-      rt_choice c = { need, true, true };
+      rt_choice c = key;
       if (ch != NULL)
         c = *ch;
       else

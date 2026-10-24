@@ -20,8 +20,10 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 
 /* Each curve's numbers have n = TPI * L 32-bit limbs, spread over TPI
  * threads (see gpu_mont.cuh).  Kernels are compiled for every L up to
- * GPU_SOLO_MAX_L (TPI = 1) and GPU_DIST_MAX_L (TPI = 2..32, chosen at run
- * time), so any N below 2^(32 * 32 * GPU_DIST_MAX_L - 4) runs without
+ * GPU_DIST_MAX_L (TPI = 2..32, chosen at run time) and, for TPI = 1, every
+ * L up to GPU_SOLO_ODD_MAX_L and the even L up to GPU_SOLO_MAX_L (an odd
+ * limb count above that takes the next even L), so any N below
+ * 2^(32 * 32 * GPU_DIST_MAX_L - 4) runs without
  * recompiling.  Which (TPI, L) to use for a given N is decided by timing
  * the candidates on the GPU (gpu_ecm_stage1_plan).
  *

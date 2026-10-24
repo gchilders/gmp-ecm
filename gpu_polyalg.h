@@ -98,7 +98,7 @@ void gpu_poly_tpeval (gpu_polyalg *A, uint32_t *vals, const uint32_t *H,
                       uint32_t *const *tree);
 
 /* OUT (one number per polynomial) <- the product of the n numbers of
-   each of VALS (below 2N); VALS is overwritten. */
+   each of VALS (below 2N); VALS is left as it is. */
 void gpu_poly_prodvals (gpu_polyalg *A, uint32_t *out, uint32_t *vals);
 
 /* Device numbers: reduce COUNT numbers below N (in place). */

@@ -24,7 +24,7 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
  *   baby steps  j Q for 1 <= j <= D/2, gcd (j, D) = 1   (table in memory)
  *   giant steps G_k = k D Q, G_{k+1} = G_k + DQ (difference G_{k-1})
  *
- * Every prime p in (B2min, B2] is k D + j or k D - j for one such j, and
+ * Every prime p in [B2min, B2] is k D + j or k D - j for one such j, and
  * p Q = O mod q implies x(G_k) = x(jQ) mod q, so the product of
  *   X(G_k) Z(jQ) - X(jQ) Z(G_k)
  * over the (k, j) pairs hit by some prime has a factor q in common with N.
@@ -91,11 +91,66 @@ gcd_ul (unsigned long a, unsigned long b)
   return a;
 }
 
-/* Sieve the primes of (lo, hi] into per-giant-step masks: bit b of giant
- * step k is set when k D +- jlist[b] is such a prime.  Fills steps
- * [k0, k0 + count); *p is the next prime to place, advanced as used. */
-struct s2_sieve {
+/* The odd primes from START up, by a segmented sieve: GMP-ECM's prime
+ * iterator starts at 2, which takes time in B2min rather than B2 - B2min
+ * when stage 2 starts at a large B2min.  START >= 3. */
+struct s2_primes {
+  static const uint32_t SEG = 1u << 18;   /* odd numbers per segment */
+  uint64_t base;          /* the segment holds base, base + 2, ... */
+  uint32_t pos;
+  std::vector<uint8_t> comp;
+  std::vector<uint32_t> bp;   /* odd primes up to sqrt (segment end) */
   prime_info_t pi;
+  uint64_t pnext;             /* the next prime of PI, not yet in BP */
+  void init (uint64_t start)
+  {
+    prime_info_init (pi);
+    pnext = getprime_mt (pi);             /* 3: it gives the odd primes */
+    bp.clear ();
+    base = (start < 3 ? 3 : start) | 1;
+    sieve ();
+  }
+  void clear () { prime_info_clear (pi); }
+  void sieve ()
+  {
+    const uint64_t end = base + 2 * (uint64_t) SEG;   /* exclusive */
+    while (pnext * pnext < end)
+      {
+        bp.push_back ((uint32_t) pnext);
+        pnext = getprime_mt (pi);
+      }
+    comp.assign (SEG, 0);
+    for (uint32_t q : bp)
+      {
+        uint64_t m = std::max ((uint64_t) q * q, (base + q - 1) / q * q);
+        if (m % 2 == 0)
+          m += q;
+        for (; m < end; m += 2 * (uint64_t) q)
+          comp[(m - base) / 2] = 1;
+      }
+    pos = 0;
+  }
+  uint64_t next ()
+  {
+    for (;;)
+      {
+        while (pos < SEG)
+          {
+            const uint32_t i = pos++;
+            if (!comp[i])
+              return base + 2 * (uint64_t) i;
+          }
+        base += 2 * (uint64_t) SEG;
+        sieve ();
+      }
+  }
+};
+
+/* Sieve the primes of [lo, hi] into per-giant-step masks: bit b of giant
+ * step k is set when k D +- jlist[b] is such a prime.  Fills steps
+ * [k0, k0 + count); p is the next prime to place, advanced as used. */
+struct s2_sieve {
+  s2_primes pr;
   uint64_t p;         /* next prime not yet placed */
   uint64_t hi;
   uint32_t D;
@@ -121,7 +176,7 @@ s2_fill_masks (s2_sieve &sv, uint32_t *mask, uint64_t k0, uint32_t count,
       if (!(*w & (1u << (b % 32))))
         sv.pairs++;
       *w |= 1u << (b % 32);
-      sv.p = getprime_mt (sv.pi);
+      sv.p = sv.pr.next ();
     }
 }
 
@@ -187,6 +242,28 @@ struct s2_cpu {
     mul (X, ZD, t3);
     mul (Z, XD, t4);
   }
+  /* (X0 : Z0) = s P, (X1 : Z1) = (s + 1) P, s >= 1 (Montgomery ladder) */
+  void ladder (mpz_t X0, mpz_t Z0, mpz_t X1, mpz_t Z1, uint64_t s,
+               const mpz_t XP, const mpz_t ZP)
+  {
+    mpz_set (X0, XP);
+    mpz_set (Z0, ZP);
+    dbl (X1, Z1, XP, ZP);
+    int b = 63;
+    while (!((s >> b) & 1))
+      b--;
+    for (b--; b >= 0; b--)
+      if ((s >> b) & 1)
+        {
+          add (X0, Z0, X1, Z1, X0, Z0, XP, ZP);
+          dbl (X1, Z1, X1, Z1);
+        }
+      else
+        {
+          add (X1, Z1, X1, Z1, X0, Z0, XP, ZP);
+          dbl (X0, Z0, X0, Z0);
+        }
+  }
 };
 
 /* G = gcd (A, N); returns 1 if it is a proper factor. */
@@ -208,8 +285,8 @@ s2_proper (mpz_t g, const mpz_t a, const mpz_t N)
 static int
 s2_replay (mpz_t f, const mpz_t x0, uint32_t sigma, const mpz_t N,
            uint32_t D, const std::vector<uint32_t> &jlist,
-           const std::vector<int> &slot, uint64_t lo, uint64_t hi,
-           uint64_t kend)
+           const std::vector<int> &slot, uint64_t start, uint64_t hi,
+           uint64_t k0, uint64_t kend)
 {
   const uint32_t nbaby = jlist.size ();
   const uint32_t mw = (nbaby + 31) / 32;
@@ -241,7 +318,7 @@ s2_replay (mpz_t f, const mpz_t x0, uint32_t sigma, const mpz_t N,
   sv.hi = hi;
   sv.pairs = 0;
   sv.slot = slot;
-  prime_info_init (sv.pi);
+  sv.pr.init (start);
   uint32_t *mask = (uint32_t *) malloc ((size_t) chunk * mw * 4);
 
   /* baby steps j Q, j odd <= D/2, as on the GPU */
@@ -266,15 +343,11 @@ s2_replay (mpz_t f, const mpz_t x0, uint32_t sigma, const mpz_t N,
   if (found)
     goto done;
 
-  /* prev = G_1 = DQ, cur = G_2 */
+  /* prev = G_(k0-1), cur = G_k0 (k0 >= 2) */
   e.dbl (DX, DZ, cX, cZ);
-  mpz_set (pX, DX);
-  mpz_set (pZ, DZ);
-  e.dbl (cX, cZ, DX, DZ);
-  do
-    sv.p = getprime_mt (sv.pi);
-  while (sv.p <= lo || sv.p * 2 < D * 3);
-  for (uint64_t k = 2; k < kend && !found; k += chunk)
+  e.ladder (pX, pZ, cX, cZ, k0 - 1, DX, DZ);
+  sv.p = sv.pr.next ();
+  for (uint64_t k = k0; k < kend && !found; k += chunk)
     {
       uint32_t cnt = (uint32_t) std::min ((uint64_t) chunk, kend - k);
       uint32_t nterm = 0;
@@ -306,7 +379,7 @@ s2_replay (mpz_t f, const mpz_t x0, uint32_t sigma, const mpz_t N,
     }
 
  done:
-  prime_info_clear (sv.pi);
+  sv.pr.clear ();
   free (mask);
   for (auto &z : bX) mpz_clear (&z);
   for (auto &z : bZ) mpz_clear (&z);
@@ -350,6 +423,58 @@ s2_wait (cudaEvent_t start, cudaEvent_t stop)
   CUDA_CHECK (cudaEventSynchronize (stop));
   CUDA_CHECK (cudaEventElapsedTime (&ms, start, stop));
   return ms;
+}
+
+/* giant steps below which empty ones are cheaper than s2_jump */
+#define S2_JUMP_MIN 16384
+
+/* Put G_(k0-1) and G_k0 (k0 D Q, Q a curve's stage 1 point) into the PREV
+   and CUR slots of each curve's state, in Montgomery form with R =
+   2^(32 n), in the layout of the kernels: NTT, per curve S_COUNT numbers of
+   n words; else per slot L words of T threads (s2_store).  Padding
+   instances are left as they are (their sums are not used). */
+static void
+s2_jump (uint32_t *g_state, bool ntt, uint32_t n, uint32_t tpi, uint32_t L,
+         uint32_t T, uint32_t padded, uint32_t curves, mpz_t *xs,
+         uint32_t sigma, const uint32_t *sigmas, const mpz_t N, uint32_t D,
+         uint64_t k0)
+{
+  const size_t words = (size_t) padded * n * S_COUNT;
+  std::vector<uint32_t> st (words), a (n);
+  CUDA_CHECK (cudaMemcpy (st.data (), g_state, words * 4,
+                          cudaMemcpyDeviceToHost));
+  mpz_t R, QZ, DX, DZ, tX, tZ, pX, pZ, cX, cZ;
+  mpz_inits (R, QZ, DX, DZ, tX, tZ, pX, pZ, cX, cZ, NULL);
+  mpz_setbit (R, 32 * (size_t) n);
+  mpz_mod (R, R, N);
+  mpz_set_ui (QZ, 1);
+  auto put = [&] (uint32_t i, int slot, const mpz_t v)
+    {
+      mpz_mul (tX, v, R);
+      mpz_mod (tX, tX, N);
+      gpu_to_limbs (a.data (), n, tX);
+      if (ntt)
+        std::copy (a.begin (), a.end (),
+                   st.begin () + ((size_t) i * S_COUNT + slot) * n);
+      else
+        for (uint32_t ln = 0; ln < tpi; ln++)
+          for (uint32_t w = 0; w < L; w++)
+            st[(size_t) slot * L * T + (size_t) w * T + i * tpi + ln]
+              = a[ln * L + w];
+    };
+  for (uint32_t i = 0; i < curves; i++)
+    {
+      s2_cpu e (N, sigmas != NULL ? sigmas[i] : sigma + i);
+      e.ladder (DX, DZ, tX, tZ, D, xs[i], QZ);           /* DQ */
+      e.ladder (pX, pZ, cX, cZ, k0 - 1, DX, DZ);        /* G_(k0-1), G_k0 */
+      put (i, S_PREV_X, pX);
+      put (i, S_PREV_Z, pZ);
+      put (i, S_CUR_X, cX);
+      put (i, S_CUR_Z, cZ);
+    }
+  CUDA_CHECK (cudaMemcpy (g_state, st.data (), words * 4,
+                          cudaMemcpyHostToDevice));
+  mpz_clears (R, QZ, DX, DZ, tX, tZ, pX, pZ, cX, cZ, NULL);
 }
 
 /* Relative costs for pacing the launches, in modular products. */
@@ -397,7 +522,7 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
     }
   uint64_t lo = mpz_sgn (B2min) > 0 ? s2_get_u64 (B2min) : 0;
   uint64_t hi = s2_get_u64 (B2);
-  if (hi <= lo)
+  if (hi < lo)
     return ECM_NO_FACTOR_FOUND;
 
   /* D: the largest primorial-type modulus whose first giant step index
@@ -438,10 +563,10 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
   sv.slot.assign (D / 2 + 1, -1);
   for (uint32_t b = 0; b < nbaby; b++)
     sv.slot[jlist[b]] = b;
-  prime_info_init (sv.pi);
-  do
-    sv.p = getprime_mt (sv.pi);
-  while (sv.p <= lo || sv.p * 2 < D * 3);  /* need k >= 2: p >= 1.5 D */
+  /* the primes of [B2min, B2] (ecm.1), from 1.5 D up (k >= 2) */
+  const uint64_t pstart = std::max (lo, (uint64_t) 3 * D / 2);
+  sv.pr.init (pstart);
+  sv.p = sv.pr.next ();
   uint64_t k0 = (sv.p + D / 2) / D;
   uint64_t kend = (hi + D / 2) / D + 1;    /* giant steps [k0, kend) */
 
@@ -555,10 +680,23 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
       i += cnt;
     }
 
+  /* Setup leaves G_1, G_2.  A first giant step k0 far above 2 (a large
+     B2min) is reached on the host instead of by k0 - 2 empty steps: per
+     curve G_(k0-1) and G_k0 by two ladders (D, then k0 - 1), put into the
+     state's PREV and CUR.  Not worth it for few steps (each empty step is
+     one xadd per curve on the GPU). */
+  uint64_t kstart = 2;
+  if (k0 > 2 + S2_JUMP_MIN && k0 < kend)
+    {
+      s2_jump (g_state, ntt != NULL, n, tpi, L, T, padded, curves, xs, sigma,
+               sigmas, N, D, k0);
+      kstart = k0;
+    }
+
   /* giant steps: sieve a chunk of masks, then launch slices of it */
   uint32_t *mask = (uint32_t *) malloc ((size_t) S2_MAX_STEPS * mw * 4);
   std::vector<uint32_t> cost (S2_MAX_STEPS);
-  uint64_t k = 2;   /* setup leaves G_2; steps below k0 have empty masks */
+  uint64_t k = kstart;   /* steps below k0 have empty masks */
   int batches = 0;
   while (k < kend)
     {
@@ -597,10 +735,10 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
           if (verbose >= OUTPUT_VERBOSE && (batches < 3 || batches % 100 == 0))
             printf ("GPU stage 2: giant step %lu/%lu (%.1f%%), %u steps/call\n",
                     (unsigned long) k, (unsigned long) kend,
-                    100.0 * (k - 2) / (kend - 2), cnt);
+                    100.0 * (k - kstart) / (kend - kstart), cnt);
         }
     }
-  prime_info_clear (sv.pi);
+  sv.pr.clear ();
 
   /* gather the accumulators */
   const size_t accw = ntt != NULL ? (size_t) padded * n * S_COUNT
@@ -637,7 +775,7 @@ gpu_ecm_stage2 (mpz_t *xs, int *array_found, const mpz_t N,
                      "has gcd N, redoing it on the CPU\n", i,
                      sigmas != NULL ? sigmas[i] : sigma + i);
             if (s2_replay (v, xs[i], sigmas != NULL ? sigmas[i] : sigma + i,
-                           N, D, jlist, sv.slot, lo, hi,
+                           N, D, jlist, sv.slot, pstart, hi, k0,
                            kend))
               mpz_set (f, v);
           }

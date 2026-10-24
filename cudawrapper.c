@@ -195,6 +195,10 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   int gpu_poly;               /* ... with the polynomial continuation? */
   mpz_t B2_parm;              /* B2 as given, or the GPU stage 2 default */
   unsigned long k_parm = params->k;   /* k as given */
+  /* the k of this call: set_stage_2_params writes its choice back, and
+     params->k must stay as given for the next number (it depends on N
+     here, through the GPU memory and the BSGS fallback) */
+  unsigned long k = k_parm;
   mpz_t *As = NULL;           /* curve parameters for the polynomial one */
   /* A resumed batch (B1done set): params->x holds the saved residues and
      params->y their sigmas, packed as main.c's gpu_resume_batch does. */
@@ -311,11 +315,11 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
           B2, B2_parm,
           B2min, params->B2min,
           &root_params,
-          B1, &mutable_params->k, params->S, gpu_poly ? 1 : params->use_ntt,
+          B1, &k, params->S, gpu_poly ? 1 : params->use_ntt,
           &po2, &dF, params->TreeFilename, params->maxmem, Fermat, modulus);
   if (gpu_stage2 && !gpu_poly)
     {
-      /* the GPU continuation covers exactly the primes in (B2min, B2], with
+      /* the GPU continuation covers exactly the primes in [B2min, B2], with
          no Brent-Suyama extension */
       mpz_set (B2, B2_parm);
       root_params.S = 1;
@@ -394,9 +398,9 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
           if (gpu_stage2 && ECM_IS_DEFAULT_B2 (B2_parm))
             mpz_set_d (B2_parm, GPU_STAGE2_DEFAULT_B2_FACTOR * B1);
           mpz_clear (root_params.i0);
-          mutable_params->k = k_parm;
+          k = k_parm;
           youpi = set_stage_2_params (B2, B2_parm, B2min, params->B2min,
-                                      &root_params, B1, &mutable_params->k,
+                                      &root_params, B1, &k,
                                       params->S, params->use_ntt, &po2, &dF,
                                       params->TreeFilename, params->maxmem,
                                       Fermat, modulus);
@@ -414,12 +418,16 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       else if (fit < dF)
         {
           int lg = ceil_log2 (fit);
+          /* F's tree levels counted as bestD counts them (none with
+             -treefile), so that its dF for this budget is at most FIT */
           double mm = memory_use (fit, (2 * mpz_sizeinbase (n, 2) + lg)
-                                       / SP_NUMB_BITS + 4, lg, modulus);
+                                       / SP_NUMB_BITS + 4,
+                                  params->TreeFilename != NULL ? 0 : lg,
+                                  modulus);
           mpz_clear (root_params.i0);
-          mutable_params->k = k_parm;
+          k = k_parm;
           youpi = set_stage_2_params (B2, B2_parm, B2min, params->B2min,
-                                      &root_params, B1, &mutable_params->k,
+                                      &root_params, B1, &k,
                                       params->S, 1, &po2, &dF,
                                       params->TreeFilename, mm * 1.000001,
                                       Fermat, modulus);
@@ -493,7 +501,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
                     B2, params->S, params->sigma, params->sigma_is_A, ECM_EC_TYPE_MONTGOMERY,
                     params->go, params->param, nb_curves);
   outputf (OUTPUT_VERBOSE, "dF=%lu, k=%lu, d=%lu, d2=%lu, i0=%Zd\n",
-           dF, params->k, root_params.d1, root_params.d2, root_params.i0);
+           dF, k, root_params.d1, root_params.d2, root_params.i0);
 
   if ((mpz_cmp (B2, B2min) < 0) && modulus->repr == ECM_MOD_BASE2 && params->nobase2step2)
     {
@@ -512,7 +520,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
       else
         {
           rhoinit (256, 10);
-          print_expcurves (B1, B2, dF, params->k, root_params.S, params->param);
+          print_expcurves (B1, B2, dF, k, root_params.S, params->param);
         }
     }
 
@@ -625,7 +633,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
           youpi = gpu_ecm_stage2_poly (factors, array_found, As, n,
                                        root_params.S, root_params.d1,
                                        root_params.d2, root_params.i0, dF,
-                                       params->k, nb_curves, &gputime2,
+                                       k, nb_curves, &gputime2,
                                        params->verbose);
           for (i = 0; i < nb_curves; i++)
             mpz_clear (As[i]);
@@ -694,7 +702,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
           mpz_clear (t);
         }
 
-      youpi = stage2 (factors[i], &P, modulus, dF, params->k, &root_params,
+      youpi = stage2 (factors[i], &P, modulus, dF, k, &root_params,
                       params->use_ntt, params->TreeFilename, i+1, params->stop_asap);
 
     next_curve:
@@ -758,7 +766,7 @@ end_gpu_ecm_rhotable:
         {
           if (youpi == ECM_NO_FACTOR_FOUND &&
               (params->stop_asap == NULL || !params->stop_asap()))
-              print_exptime (B1, B2, dF, params->k, root_params.S,
+              print_exptime (B1, B2, dF, k, root_params.S,
                              (long) (tottime / nb_curves), params->param);
           rhoinit (1, 0); /* Free memory of rhotable */
         }

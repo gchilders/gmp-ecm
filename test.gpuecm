@@ -146,6 +146,13 @@ fi
 echo "2^349-1" | $ECM -gpubsgs -sigma 3:13 587 1423
 checkcode $? 6
 
+# the B2min-B2max form includes B2min (ecm.1): from 1423 on it is found,
+# from 1424 on not
+echo "2^349-1" | $ECM -gpubsgs -sigma 3:13 587 1423-1500
+checkcode $? 6
+echo "2^349-1" | $ECM -gpubsgs -sigma 3:13 587 1424-1500
+checkcode $? 0
+
 # same with stage 2 on the CPU (its FFT continuation rounds B2 up to 1446)
 echo "2^349-1" | $ECM -cpustage2 -sigma 3:13 587 1261
 checkcode $? 6

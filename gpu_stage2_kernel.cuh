@@ -117,9 +117,10 @@ xadd (const G &g, uint32_t (&X)[L], uint32_t (&Z)[L],
  * one that runs a kernel for more than 2 s). */
 
 /* Build the baby-step table and DQ, and set up the giant steps at
- * G_1 = DQ, G_2 = 2 DQ (the host starts the main kernel at k = 2, with
- * empty masks up to the first giant step it needs; that costs one xadd per
- * skipped step, about B2min / D, which is small next to the B2 / D steps).
+ * G_1 = DQ, G_2 = 2 DQ (the host starts the main kernel at k = 2 with empty
+ * masks up to the first giant step k0 it needs, one xadd per skipped step;
+ * when k0 is large, a large B2min, it puts G_(k0-1) and G_k0 into the state
+ * itself instead: s2_jump in gpu_stage2.cu).
  * The work is one loop with a single xdbl and a single xadd call site:
  * inlining several of each, for every kernel shape, made compiles slow.
  *
