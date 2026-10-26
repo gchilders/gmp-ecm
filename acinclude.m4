@@ -595,7 +595,8 @@ AS_IF([test "x$enable_gpu" = "xyes" ],
     LIBS="$LIBS_BACKUP"
     LDFLAGS="$LDFLAGS_BACKUP"
 
-    NVCCFLAGS="$NVCCFLAGS $GPU_ARCH"
+    dnl the lowest architecture, for code that needs a newer one (gpu_nmul.cuh)
+    NVCCFLAGS="$NVCCFLAGS $GPU_ARCH -DGPU_MIN_CC=$MIN_CC"
     CFLAGS="$CFLAGS -DWITH_GPU"
     CPPFLAGS="$CPPFLAGS -DWITH_GPU"
 

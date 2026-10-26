@@ -1271,25 +1271,26 @@ GM_DEV void gm_mul_ui (const G &g, uint32_t (&r)[L],
                        const uint32_t (&m)[L], uint32_t mp0)
 {
   if constexpr (gm_use_eo<L, SOLO>::value)
+    gm_mul_ui_eo<L> (r, a, d, m, mp0);
+  else
     {
-      gm_mul_ui_eo<L> (r, a, d, m, mp0);
-      return;
+      /* one gm_row */
+      uint32_t acc[L];
+#pragma unroll
+      for (int k = 0; k < L; k++)
+        acc[k] = 0;
+      uint32_t c = 0;
+      gm_row<L, SOLO, 0> (g, acc, c, d, a, m, mp0);
+      /* acc is now rotated by 1 */
+      uint32_t t[L];
+#pragma unroll
+      for (int k = 0; k < L; k++)
+        t[k] = acc[(k + 1) % L];
+      gm_fold<L, SOLO> (g, t, c);
+#pragma unroll
+      for (int k = 0; k < L; k++)
+        r[k] = t[k];
     }
-  uint32_t acc[L];
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    acc[k] = 0;
-  uint32_t c = 0;
-  gm_row<L, SOLO, 0> (g, acc, c, d, a, m, mp0);
-  /* acc is now rotated by 1 */
-  uint32_t t[L];
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    t[k] = acc[(k + 1) % L];
-  gm_fold<L, SOLO> (g, t, c);
-#pragma unroll
-  for (int k = 0; k < L; k++)
-    r[k] = t[k];
 }
 
 #endif /* _GPU_MONT_CUH */

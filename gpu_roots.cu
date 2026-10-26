@@ -922,7 +922,7 @@ nt_add (const nm_ctx &c, int32_t *R, const int32_t *P, const int32_t *Q,
    projective factor, so the same roots) */
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_setup_kernel (const __grid_constant__ nm_ctx c, int mode, uint32_t count,
+nt_setup_kernel (const NM_GRID_CONST nm_ctx c, int mode, uint32_t count,
                  const int32_t * __restrict__ cst,
                  const uint32_t * __restrict__ chat, int32_t * __restrict__ W,
                  uint32_t K, uint32_t w, uint32_t nw, uint32_t k0,
@@ -1006,7 +1006,7 @@ nt_setup_kernel (const __grid_constant__ nm_ctx c, int mode, uint32_t count,
 /* as rt_step_body */
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_step_kernel (const __grid_constant__ nm_ctx c, uint32_t ninst, uint32_t nr,
+nt_step_kernel (const NM_GRID_CONST nm_ctx c, uint32_t ninst, uint32_t nr,
                 uint32_t S, int32_t * __restrict__ state,
                 const uint32_t * __restrict__ chat,
                 const int32_t * __restrict__ slots, uint64_t base,
@@ -1070,7 +1070,7 @@ nt_step_kernel (const __grid_constant__ nm_ctx c, uint32_t ninst, uint32_t nr,
    RV_FINAL) */
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_vec_kernel (const __grid_constant__ nm_ctx c, int mode, uint64_t count,
+nt_vec_kernel (const NM_GRID_CONST nm_ctx c, int mode, uint64_t count,
                const int32_t * __restrict__ a, uint64_t na,
                int32_t * __restrict__ b, uint32_t * __restrict__ out,
                uint32_t nl, int32_t * __restrict__ scr)
@@ -1127,7 +1127,7 @@ nt_vec_kernel (const __grid_constant__ nm_ctx c, int mode, uint64_t count,
 
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_tree_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t d,
+nt_tree_kernel (const NM_GRID_CONST nm_ctx c, uint64_t count, uint32_t d,
                 const uint32_t * __restrict__ in, uint32_t * __restrict__ out,
                 uint32_t nl, int32_t * __restrict__ scr)
 {
@@ -1171,7 +1171,7 @@ nt_tree_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t d,
 
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_mp_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t half,
+nt_mp_kernel (const NM_GRID_CONST nm_ctx c, uint64_t count, uint32_t half,
               const uint32_t * __restrict__ tv,
               const uint32_t * __restrict__ tree, uint32_t * __restrict__ out,
               uint32_t nl, int32_t * __restrict__ scr)
@@ -1222,7 +1222,7 @@ nt_mp_kernel (const __grid_constant__ nm_ctx c, uint64_t count, uint32_t half,
 /* the hats of each curve's a, d, C1, C2, C3 (numbers RC_A .. RC_C3) */
 template<int LG>
 __global__ void __launch_bounds__ ((1 << LG) / 8, NT_MINB (LG))
-nt_chat_kernel (const __grid_constant__ nm_ctx c, uint32_t count,
+nt_chat_kernel (const NM_GRID_CONST nm_ctx c, uint32_t count,
                 const int32_t * __restrict__ cst, uint32_t * __restrict__ chat)
 {
   constexpr size_t D = 1 << LG;

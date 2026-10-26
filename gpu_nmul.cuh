@@ -106,6 +106,16 @@ nm_smem_bytes (int lg)
 
 #define NM_DEV __device__ __forceinline__
 
+/* The kernels take their nm_ctx by value and use it by reference:
+   __grid_constant__ (compute capability 7.0 and up) spares each thread a
+   copy of it.  A build that also targets older GPUs (GPU_MIN_CC, the
+   lowest architecture configure chose, below 70) goes without. */
+#if defined (GPU_MIN_CC) && GPU_MIN_CC < 70
+#define NM_GRID_CONST
+#else
+#define NM_GRID_CONST __grid_constant__
+#endif
+
 extern __shared__ uint32_t nm_sm[];
 
 NM_DEV uint32_t nm_shoup (uint32_t a, uint32_t w, uint32_t wsh, uint32_t p)
@@ -960,7 +970,7 @@ nm_value (mpz_t r, const int32_t *dg, int D, int b)
 
 template<int LG>
 __global__ void
-nm_hat_kernel (const __grid_constant__ nm_ctx c, uint32_t *H, const int32_t *X,
+nm_hat_kernel (const NM_GRID_CONST nm_ctx c, uint32_t *H, const int32_t *X,
                uint32_t count)
 {
   for (uint32_t i = blockIdx.x; i < count; i += gridDim.x)
