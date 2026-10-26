@@ -32,8 +32,8 @@
 #define NV 8      /* numbers per instance per round: x y z h x' y' z' back */
 
 template<int LG>
-__global__ void
-test_kernel (const __grid_constant__ nm_ctx c, int rounds, int32_t *V,
+__global__ void __launch_bounds__ ((1 << LG) / 8)
+test_kernel (const NM_GRID_CONST nm_ctx c, int rounds, int32_t *V,
              uint32_t *H, uint32_t *limbs, uint32_t nl)
 {
   constexpr int D = 1 << LG;
@@ -74,8 +74,8 @@ test_kernel (const __grid_constant__ nm_ctx c, int rounds, int32_t *V,
 #define NS 16     /* products per sum */
 
 template<int LG>
-__global__ void
-sum16_kernel (const __grid_constant__ nm_ctx c, const int32_t *X, uint32_t *H,
+__global__ void __launch_bounds__ ((1 << LG) / 8)
+sum16_kernel (const NM_GRID_CONST nm_ctx c, const int32_t *X, uint32_t *H,
               int32_t *S, int32_t *Out)
 {
   constexpr int D = 1 << LG;

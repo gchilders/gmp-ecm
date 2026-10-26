@@ -968,8 +968,11 @@ nm_value (mpz_t r, const int32_t *dg, int D, int b)
     }
 }
 
+/* one block of D / 8 threads per number: the bound keeps the registers
+   within a block of 512 threads at D = 4096 (else the launch fails on
+   GPUs that would give the kernel more, e.g. compute capability 6.1) */
 template<int LG>
-__global__ void
+__global__ void __launch_bounds__ ((1 << LG) / 8)
 nm_hat_kernel (const NM_GRID_CONST nm_ctx c, uint32_t *H, const int32_t *X,
                uint32_t count)
 {
