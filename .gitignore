@@ -4,6 +4,7 @@
 *.la
 *.in
 aprtcle/.dirstamp
+LucasChainGenerator/src/.dirstamp
 
 # Binaries
 aprcl
@@ -14,6 +15,7 @@ manyecm
 rho
 test-driver
 tune
+LucasChainGen
 nodist/countsmooth
 *.exe
 
@@ -30,7 +32,12 @@ stamp-h2
 # Test logs
 test.*.log
 test.*.trs
+test-suite.log
 *.txt
+
+# Written by LucasChainGen during the build
+LCG.log
+Lchain_codes.dat
 
 # Misc
 autom4te.cache/
